@@ -1,0 +1,45 @@
+# systemd 服务单元示例
+#
+# 安装：
+#   sudo cp deploy/plan-manager.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now plan-manager
+#
+# 查看日志：
+#   journalctl -u plan-manager -f
+#
+# 注意：把下面的 User / WorkingDirectory 改成你自己的实际值。
+
+[Unit]
+Description=计划管理 (Plan Manager)
+Documentation=file:///opt/plan-manager/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/plan-manager
+
+Environment=PLAN_DB_PATH=/var/lib/plan-manager/plan.db
+Environment=PLAN_HOST=127.0.0.1
+Environment=PLAN_PORT=8000
+# 走 HTTPS 时打开（配合 Nginx 反向代理）
+# Environment=PLAN_COOKIE_SECURE=1
+
+ExecStart=/opt/plan-manager/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips='127.0.0.1'
+
+Restart=on-failure
+RestartSec=3
+
+# 基础加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/plan-manager
+
+[Install]
+WantedBy=multi-user.target

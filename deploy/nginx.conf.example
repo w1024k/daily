@@ -1,0 +1,54 @@
+# Nginx 反向代理示例（含 HTTPS）
+#
+# 放到 /etc/nginx/sites-available/plan-manager 再软链到 sites-enabled，
+# 证书可以用 certbot 申请： sudo certbot --nginx -d plan.example.com
+#
+# 用 HTTPS 时记得给服务加环境变量 PLAN_COOKIE_SECURE=1，
+# 否则 cookie 的 Secure 标记不会打开。
+
+upstream plan_manager {
+    server 127.0.0.1:8000;
+    keepalive 8;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name plan.example.com;
+    # 只走 HTTPS
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name plan.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/plan.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/plan.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # 任务内容是用户输入，限制一下请求体大小
+    client_max_body_size 64k;
+
+    # 静态资源加个缓存
+    location /static/ {
+        proxy_pass http://plan_manager;
+        proxy_set_header Host $host;
+        expires 7d;
+        add_header Cache-Control "public";
+    }
+
+    location / {
+        proxy_pass http://plan_manager;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+        proxy_read_timeout 30s;
+    }
+}

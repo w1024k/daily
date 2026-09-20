@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<!-- 深浅色下浏览器 UI（地址栏等）各自的配色 -->
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#131519" media="(prefers-color-scheme: dark)">
+<meta name="description" content="一个简单优雅的个人计划管理应用">
+<title>计划管理</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ── 登录 / 注册 ───────────────────────────────────────────── -->
+<section class="auth" id="auth-view">
+  <div class="auth__card">
+    <div class="auth__logo" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="30" height="30">
+        <rect width="32" height="32" rx="9" fill="currentColor"/>
+        <path d="M9 16.5l4.5 4.5L23 11.5" stroke="#fff" stroke-width="3"
+              stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      </svg>
+    </div>
+    <h1 class="auth__title" id="auth-title">欢迎回来</h1>
+    <p class="auth__subtitle" id="auth-subtitle">登录后开始管理你的计划</p>
+
+    <form class="auth__form" id="auth-form" novalidate>
+      <label class="field">
+        <span class="field__label">用户名</span>
+        <!-- 移动端键盘不自动首字母大写/纠错，避免用户名被改写 -->
+        <input class="field__input" id="auth-username" name="username" type="text"
+               placeholder="2-32 个字符，不支持空格" autocomplete="username"
+               autocapitalize="none" autocorrect="off" spellcheck="false"
+               enterkeyhint="next" maxlength="32" required>
+      </label>
+      <label class="field">
+        <span class="field__label">密码</span>
+        <input class="field__input" id="auth-password" name="password" type="password"
+               placeholder="至少 6 位" autocomplete="current-password"
+               enterkeyhint="go" maxlength="128" required>
+      </label>
+      <p class="form-error" id="auth-error" role="alert" hidden></p>
+      <button class="btn btn--primary btn--block" id="auth-submit" type="submit">登录</button>
+    </form>
+
+    <p class="auth__switch">
+      <span id="auth-switch-hint">还没有账号？</span>
+      <button class="link" id="auth-switch" type="button">立即注册</button>
+    </p>
+  </div>
+</section>
+
+<!-- ── 主界面 ────────────────────────────────────────────────── -->
+<section class="app" id="app-view" hidden>
+  <header class="topbar">
+    <div class="topbar__brand">
+      <svg class="topbar__logo" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+        <rect width="32" height="32" rx="9" fill="currentColor"/>
+        <path d="M9 16.5l4.5 4.5L23 11.5" stroke="#fff" stroke-width="3"
+              stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      </svg>
+      <span>计划管理</span>
+    </div>
+    <div class="topbar__user">
+      <span class="topbar__name" id="current-user"></span>
+      <button class="link" id="logout" type="button">退出</button>
+    </div>
+  </header>
+
+  <main class="board" id="board">
+    <div class="board__meta" id="board-meta"></div>
+
+    <ul class="tasks" id="task-list"></ul>
+
+    <div class="empty" id="empty-state" hidden>
+      <div class="empty__icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="34" height="34" fill="none"
+             stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="3" width="16" height="18" rx="3"/>
+          <path d="M8.5 9h7M8.5 13h7M8.5 17h4"/>
+        </svg>
+      </div>
+      <p class="empty__text">还没有任何计划</p>
+      <p class="empty__hint">在下面的输入框写下第一件事吧</p>
+    </div>
+  </main>
+
+  <footer class="composer">
+    <form class="composer__form" id="task-form" novalidate>
+      <input class="composer__input" id="task-input" type="text" name="content"
+             placeholder="要做什么？回车即可添加" maxlength="200" aria-label="新计划内容"
+             autocomplete="off" autocorrect="off" spellcheck="false"
+             enterkeyhint="send" required>
+      <button class="btn btn--primary composer__submit" id="task-submit" type="submit">添加</button>
+    </form>
+  </footer>
+</section>
+
+<!-- ── 确认弹窗 ──────────────────────────────────────────────── -->
+<div class="modal" id="modal" hidden>
+  <div class="modal__backdrop" data-dismiss="modal"></div>
+  <div class="modal__panel" role="alertdialog" aria-modal="true"
+       aria-labelledby="modal-title" aria-describedby="modal-text">
+    <h2 class="modal__title" id="modal-title">确认删除</h2>
+    <p class="modal__text" id="modal-text"></p>
+    <div class="modal__actions">
+      <button class="btn btn--ghost" id="modal-cancel" type="button">取消</button>
+      <button class="btn btn--danger" id="modal-confirm" type="button">删除</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 轻提示 ────────────────────────────────────────────────── -->
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
