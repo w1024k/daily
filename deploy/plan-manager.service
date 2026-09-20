@@ -12,7 +12,7 @@
 
 [Unit]
 Description=计划管理 (Plan Manager)
-Documentation=file:///opt/plan-manager/README.md
+Documentation=file:///data/code/daily/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -20,7 +20,7 @@ Wants=network-online.target
 Type=simple
 User=www-data
 Group=www-data
-WorkingDirectory=/opt/plan-manager
+WorkingDirectory=/data/code/daily
 
 Environment=PLAN_DB_PATH=/var/lib/plan-manager/plan.db
 # 0.0.0.0 = 监听所有网卡（局域网/公网可直接访问）
@@ -30,8 +30,9 @@ Environment=PLAN_PORT=8000
 # 走 HTTPS 时打开（配合 Nginx 反向代理）
 # Environment=PLAN_COOKIE_SECURE=1
 
-ExecStart=/opt/plan-manager/.venv/bin/uvicorn app.main:app \
-    --host 0.0.0.0 --port 8000 
+ExecStart=/data/code/daily/.venv/bin/uvicorn app.main:app \
+    --host 0.0.0.0 --port 8000
+
 Restart=on-failure
 RestartSec=3
 
