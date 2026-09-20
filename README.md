@@ -107,7 +107,49 @@ curl http://127.0.0.1:8000/api/health
 数据库默认落在 `/var/lib/plan-manager/plan.db`（由服务单元里的 `PLAN_DB_PATH` 指定）。
 **备份就是复制这个文件**（连同 `-wal` 后缀的文件一起）。
 
-### 方式二：Docker
+### 方式二：uv + systemd（用 uv 建环境，装依赖更快）
+
+和方式一唯一的区别是**环境怎么建**：uv 是一个独立二进制，不依赖系统里的
+pip，装依赖通常快一个数量级，需要时还能顺手帮你下载对应版本的 Python。
+
+```bash
+# 1. 全局装 uv（不需要先有 Python）
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh
+
+# 2. 放置代码
+sudo mkdir -p /opt/plan-manager /var/lib/plan-manager
+sudo cp -r app requirements.txt /opt/plan-manager/
+cd /opt/plan-manager
+
+# 3. 建虚拟环境 + 装依赖
+#    UV_PYTHON_INSTALL_DIR 让 uv 下载的 Python 落在 /opt 下，
+#    否则默认装到 root 的家目录，服务账号 www-data 读不到
+sudo env UV_PYTHON_INSTALL_DIR=/opt/plan-manager/.uv-python \
+    uv venv --python 3.12 .venv
+sudo env UV_PYTHON_INSTALL_DIR=/opt/plan-manager/.uv-python \
+    uv pip install --python .venv/bin/python -r requirements.txt
+
+# 4. 数据目录交给服务账号
+sudo chown -R www-data:www-data /opt/plan-manager /var/lib/plan-manager
+
+# 5. 装服务（服务单元的 ExecStart 就指向 .venv/bin/uvicorn，不用改）
+sudo cp deploy/plan-manager.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now plan-manager
+```
+
+uv 建的 `.venv` 和 venv 模块建出来的布局完全一样，所以运行时并不需要 uv——
+服务单元照旧直接执行 `.venv/bin/uvicorn`。uv 只用在安装那一步。
+
+以后 `requirements.txt` 变了，重新装一次依赖再重启即可：
+
+```bash
+sudo env UV_PYTHON_INSTALL_DIR=/opt/plan-manager/.uv-python \
+    uv pip install --python /opt/plan-manager/.venv/bin/python -r requirements.txt
+sudo systemctl restart plan-manager
+```
+
+### 方式三：Docker
 
 ```bash
 docker build -t plan-manager .
@@ -127,7 +169,7 @@ docker run --rm -v plan-data:/data -v "$PWD:/backup" alpine \
 
 要暴露到公网，请在容器前面加一层 HTTPS 反向代理。
 
-### 方式三：Nginx + HTTPS
+### 方式四：Nginx + HTTPS
 
 `deploy/nginx.conf.example` 是一份可直接改的配置，包含 80 → 443 跳转、
 证书配置和反向代理转发。要点：
