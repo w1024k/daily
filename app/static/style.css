@@ -37,6 +37,7 @@
 
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, .04), 0 1px 3px rgba(16, 24, 40, .05);
   --shadow-md: 0 12px 32px rgba(16, 24, 40, .14);
+  --shadow-drag: 0 18px 40px rgba(16, 24, 40, .22);
 
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
           "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
@@ -79,6 +80,7 @@
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
     --shadow-md: 0 12px 32px rgba(0, 0, 0, .45);
+    --shadow-drag: 0 18px 40px rgba(0, 0, 0, .6);
   }
 }
 
@@ -351,6 +353,8 @@ button { font: inherit; color: inherit; }
 }
 
 .task {
+  /* 窄屏下圆点会绝对定位到卡片右上角，卡片要有定位上下文 */
+  position: relative;
   display: flex;
   align-items: flex-start;
   gap: 12px;
@@ -359,7 +363,10 @@ button { font: inherit; color: inherit; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
-  box-shadow: var(--shadow-sm);
+  /* 用变量中转阴影：抬起的几种状态（按下 / 拖动）只改变量，
+     标了颜色的卡片那条 inset 色条就不会被覆盖掉 */
+  --task-shadow: var(--shadow-sm);
+  box-shadow: var(--task-shadow);
   transition: border-color .18s var(--ease), background .18s var(--ease),
               box-shadow .18s var(--ease), opacity .18s var(--ease),
               transform .18s var(--ease);
@@ -529,7 +536,7 @@ button { font: inherit; color: inherit; }
 .task--red,
 .task--yellow,
 .task--green {
-  box-shadow: inset 3px 0 0 var(--task-color), var(--shadow-sm);
+  box-shadow: inset 3px 0 0 var(--task-color), var(--task-shadow);
 }
 
 @supports (background: color-mix(in srgb, red 50%, blue)) {
@@ -556,6 +563,10 @@ button { font: inherit; color: inherit; }
   cursor: grab;
   /* 触摸从把手开始时不触发列表滚动，滚动照常从卡片其他区域触发 */
   touch-action: none;
+  /* 按住把手的瞬间浏览器不参与：不然长按会唤起「选择 / 复制」而打断拖动 */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
   transition: opacity .15s var(--ease);
 }
@@ -563,12 +574,23 @@ button { font: inherit; color: inherit; }
 .task:hover .task__grip,
 .task:focus-within .task__grip { opacity: .6; }
 
+/* 按住的瞬间就给反馈（拖动还没真正开始），手感和「按得准不准」都靠它 */
+.task.is-pressed,
+.task.is-dragging {
+  --task-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+
+.task.is-pressed .task__grip { opacity: 1; }
+
 .task.is-dragging {
   position: relative;
   z-index: 1;
+  /* 抬得比「按下」更高，再微微放大：手指底下要有「拿起来了」的反馈 */
+  --task-shadow: var(--shadow-drag);
+  transform: scale(1.02);
   opacity: .94;
   cursor: grabbing;
-  box-shadow: var(--shadow-md);
   /* 同上：解除入场动画对 transform/opacity 的锁定，FLIP 才能生效 */
   animation: none;
 }
@@ -707,6 +729,16 @@ body.is-sorting .task { user-select: none; -webkit-user-select: none; }
   .task__actions { opacity: 1; }
   .task__colors { opacity: 1; }
 
+  /*
+   * 触摸设备上长按卡片任意位置都能拖动，所以卡片里的文字一律不参与选中：
+   * 否则长按会先弹出「选择 / 复制」菜单，把拖动手势打断。
+   */
+  .task {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+
   /* 扩大勾选按钮的点击热区，但不改变视觉大小 */
   .task__check { position: relative; }
   .task__check::after {
@@ -716,12 +748,16 @@ body.is-sorting .task { user-select: none; -webkit-user-select: none; }
     border-radius: 50%;
   }
 
-  /* 拖动把手常显，并上下扩大热区（左右不扩，避免盖住勾选按钮） */
+  /*
+   * 拖动把手常显，热区上下各扩 16px（撑到 44px 左右的触摸目标）、
+   * 左侧铺到卡片边缘：手指比鼠标粗得多，14px 宽的把手太难点中。
+   * 右侧只扩 5px，免得盖住勾选按钮。
+   */
   .task__grip { opacity: .5; position: relative; }
   .task__grip::after {
     content: '';
     position: absolute;
-    inset: -8px 0;
+    inset: -16px -5px -16px -10px;
   }
 
   /* 触摸目标尽量接近 44px */
@@ -759,6 +795,18 @@ body.is-sorting .task { user-select: none; -webkit-user-select: none; }
     /* 与正文左对齐（把手 + 勾选按钮宽度 + 间距） */
     padding-left: 58px;
   }
+
+  /*
+   * 圆点固定在卡片右上角，脱离换行流：正文一长，它就会被挤到单独一行，
+   * 既不好看也不好点。正文让出右侧空间，文字不会压到圆点上。
+   */
+  .task__colors {
+    position: absolute;
+    top: 11px;
+    right: 11px;
+    margin-top: 0;
+  }
+  .task__body { padding-right: 70px; }
 
   .empty { margin-top: 6vh; }
   .auth__card { padding: 28px 22px 22px; }

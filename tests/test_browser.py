@@ -38,6 +38,9 @@ DESKTOP = {"width": 1440, "height": 900}
 
 PASSWORD = "browser-test-123"
 
+#: 窄屏上会折行的长正文，用来验证「正文变长会不会把别的元素挤走」
+LONG_CONTENT = "这是一条很长的任务描述，长到在手机屏幕上要折成好几行才放得下，用来检查布局"
+
 #: 「已完成」状态的样式类
 DONE_CLASS = re.compile(r"\btask--done\b")
 
@@ -189,6 +192,31 @@ def task_row(page, content):
     return page.locator(".task").filter(has_text=content).first
 
 
+def touch_point(page, locator, *, dx=40, dy=8) -> tuple[float, float]:
+    """在 locator 上取一个点，并确认落点确实在卡片上（不是按钮）。
+
+    触摸坐标由 CDP 直接投递，不会像 page.click 那样帮忙滚动或校验；
+    画布滚动过、坐标算错时，事件会落到别的元素上，所以这里先验一次。
+    """
+    box = locator.bounding_box()
+    x, y = box["x"] + dx, box["y"] + dy
+    target = page.evaluate(
+        """([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            if (!el) return 'null';
+            if (el.closest('button')) return 'button';
+            return el.className.toString() || el.tagName;
+        }""",
+        [x, y],
+    )
+    assert target not in ("null", "button"), f"落点 ({x:.0f},{y:.0f}) 不在卡片正文上：{target}"
+    return x, y
+
+
+def dispatch_touch(session, kind, points=None):
+    session.send("Input.dispatchTouchEvent", {"type": kind, "touchPoints": points or []})
+
+
 def no_horizontal_overflow(page) -> tuple[bool, str]:
     """页面是否出现了横向滚动（响应式最常见的翻车点）。"""
     metrics = page.evaluate(
@@ -298,6 +326,60 @@ class TestResponsiveLayout:
             left_gap = box["x"]
             right_gap = DESKTOP["width"] - (box["x"] + box["width"])
             assert abs(left_gap - right_gap) < 2, f"未居中: 左 {left_gap} 右 {right_gap}"
+        finally:
+            page.context.close()
+
+    @pytest.mark.parametrize("viewport", [SMALL_PHONE, PHONE])
+    def test_color_dots_stay_in_the_card_corner(self, chromium, live_server, viewport):
+        """窄屏上圆点固定在卡片右上角。
+
+        正文一长，圆点就会被挤到单独一行（还压在按钮行上方），
+        所以这里量的是几何关系，而不只是「元素存在」。
+        """
+        page = _new_page(chromium, viewport, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("dotpos"))
+            add_task(page, "短")
+            add_task(page, LONG_CONTENT)
+
+            rows = page.evaluate(
+                """() => [...document.querySelectorAll('.task')].map(li => {
+                    const box = el => { const r = el.getBoundingClientRect(); return {
+                        top: Math.round(r.top), left: Math.round(r.left),
+                        right: Math.round(r.right), bottom: Math.round(r.bottom) }; };
+                    const range = document.createRange();
+                    range.selectNodeContents(li.querySelector('.task__content'));
+                    return {
+                        card: box(li),
+                        check: box(li.querySelector('.task__check')),
+                        colors: box(li.querySelector('.task__colors')),
+                        actions: box(li.querySelector('.task__actions')),
+                        lines: [...range.getClientRects()].map(r => ({
+                            top: Math.round(r.top), bottom: Math.round(r.bottom), right: Math.round(r.right) })),
+                        text: li.querySelector('.task__content').textContent,
+                    };
+                })"""
+            )
+            assert len(rows) == 2, rows
+
+            for row in rows:
+                tag = f"{viewport['width']}px 「{row['text'][:6]}」"
+                colors, card = row["colors"], row["card"]
+                # 与勾选按钮同一行（这就是「没被挤到第二行」的样子）
+                assert abs(colors["top"] - row["check"]["top"]) <= 12, f"{tag} 圆点与勾选不在同一行: {row}"
+                # 贴在卡片右上角
+                assert 0 < card["right"] - colors["right"] <= 24, f"{tag} 圆点没贴住右边: {row}"
+                assert 0 <= colors["top"] - card["top"] <= 24, f"{tag} 圆点没贴住顶边: {row}"
+                # 在按钮行上方，说明没有掉到下一行
+                assert colors["bottom"] < row["actions"]["top"], f"{tag} 圆点掉到按钮行: {row}"
+                # 正文的文字行不跟圆点重叠
+                for line in row["lines"]:
+                    overlaps = (
+                        line["right"] > colors["left"]
+                        and line["bottom"] > colors["top"]
+                        and line["top"] < colors["bottom"]
+                    )
+                    assert not overlaps, f"{tag} 文字压到了圆点: 行={line} 圆点={colors}"
         finally:
             page.context.close()
 
@@ -665,15 +747,11 @@ class TestDragAndReorder:
             with page.expect_response(
                 lambda resp: resp.request.method == "PUT" and resp.url.endswith("/api/tasks/order")
             ):
-                session.send("Input.dispatchTouchEvent", {
-                    "type": "touchStart", "touchPoints": [{"x": x, "y": start_y}],
-                })
+                dispatch_touch(session, "touchStart", [{"x": x, "y": start_y}])
                 for step in range(1, 11):
                     y = start_y + (end_y - start_y) * step / 10
-                    session.send("Input.dispatchTouchEvent", {
-                        "type": "touchMove", "touchPoints": [{"x": x, "y": y}],
-                    })
-                session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+                    dispatch_touch(session, "touchMove", [{"x": x, "y": y}])
+                dispatch_touch(session, "touchEnd")
 
             expect(page.locator(".task").nth(0)).to_contain_text("第二条")
             expect(page.locator(".task").nth(1)).to_contain_text("第一条")
@@ -682,6 +760,188 @@ class TestDragAndReorder:
             page.reload()
             expect(page.locator(".task").nth(0)).to_contain_text("第二条")
             expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+        finally:
+            page.context.close()
+
+    #: 与 app.js 里的 LONG_PRESS_MS 一致：按住这么久才算长按。
+    #: 这里多等一点，避免计时器还没到点断言就失败了。
+    LONG_PRESS_MS = 300
+
+    def _wait_for_drag_start(self, page, session, x, y):
+        dispatch_touch(session, "touchStart", [{"x": x, "y": y}])
+        page.wait_for_timeout(self.LONG_PRESS_MS + 80)
+        expect(page.locator(".task.is-dragging")).to_have_count(1)
+
+    def test_long_press_on_card_reorders(self, chromium, live_server):
+        """手机上长按卡片正文就能拖动：把手只有 14px 宽，手指很难按准。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("longpress"))
+            # 展示顺序 [第三条, 第二条, 第一条]
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            session = page.context.new_cdp_session(page)
+            x, start_y = touch_point(page, page.locator(".task").nth(0).locator(".task__content"), dy=4)
+            target = page.locator(".task").nth(2).bounding_box()
+            end_y = target["y"] + target["height"] - 4
+
+            with page.expect_response(
+                lambda resp: resp.request.method == "PUT" and resp.url.endswith("/api/tasks/order")
+            ):
+                self._wait_for_drag_start(page, session, x, start_y)
+                for step in range(1, 11):
+                    dispatch_touch(session, "touchMove", [{"x": x, "y": start_y + (end_y - start_y) * step / 10}])
+                    page.wait_for_timeout(16)
+                dispatch_touch(session, "touchEnd")
+
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第一条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+
+            # 长按全程不该选中文字（否则浏览器会弹出「选择 / 复制」把拖动打断）
+            assert page.evaluate("() => window.getSelection().toString()") == ""
+            # 松手后不留状态：卡片不再抬起，页面也退出排序模式
+            assert page.evaluate("() => document.querySelectorAll('.is-dragging,.is-pressed').length") == 0
+            assert page.evaluate("() => document.body.classList.contains('is-sorting')") is False
+
+            page.reload()
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+        finally:
+            page.context.close()
+
+    def test_long_press_without_moving_keeps_order(self, chromium, live_server):
+        """长按后原地松手：不该重排，也不该向服务端提交顺序。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("longpresshold"))
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            puts = []
+            page.on(
+                "request",
+                lambda request: puts.append(request.url)
+                if request.method == "PUT" and "/api/tasks/order" in request.url
+                else None,
+            )
+
+            session = page.context.new_cdp_session(page)
+            x, y = touch_point(page, page.locator(".task").nth(0).locator(".task__content"), dy=4)
+            self._wait_for_drag_start(page, session, x, y)
+            dispatch_touch(session, "touchEnd")
+            page.wait_for_timeout(300)
+
+            expect(page.locator(".task").nth(0)).to_contain_text("第三条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第一条")
+            assert puts == [], f"原地松手不该提交排序：{puts}"
+            assert page.evaluate("() => document.querySelectorAll('.is-dragging,.is-pressed').length") == 0
+        finally:
+            page.context.close()
+
+    def test_quick_swipe_scrolls_instead_of_dragging(self, chromium, live_server):
+        """没到长按时间就滑动 = 用户在滚列表，交还滚动手势。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("swipes"))
+            for index in range(1, 15):
+                add_task(page, f"第{index}件")
+            page.evaluate("() => { document.querySelector('.board').scrollTop = 0; }")
+            page.wait_for_timeout(150)
+
+            session = page.context.new_cdp_session(page)
+            x, y = touch_point(page, page.locator(".task").nth(3).locator(".task__content"), dy=4)
+            first = page.locator(".task").nth(0).inner_text()
+
+            dispatch_touch(session, "touchStart", [{"x": x, "y": y}])
+            for step in range(1, 9):
+                dispatch_touch(session, "touchMove", [{"x": x, "y": y - step * 24}])
+                page.wait_for_timeout(16)
+            dispatch_touch(session, "touchEnd")
+            page.wait_for_timeout(300)
+
+            scrolled = page.evaluate("() => Math.round(document.querySelector('.board').scrollTop)")
+            assert scrolled > 0, "快速滑动应该滚动列表"
+            # 顺序没动，也没有残留的按下 / 拖动状态
+            assert page.locator(".task").nth(0).inner_text() == first
+            assert page.evaluate("() => document.querySelectorAll('.is-dragging,.is-pressed').length") == 0
+        finally:
+            page.context.close()
+
+    def test_list_does_not_scroll_while_dragging(self, chromium, live_server):
+        """拖动期间要把列表滚动按住，否则卡片会跟着手指跑。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("dragscroll"))
+            for index in range(1, 15):
+                add_task(page, f"第{index}件")
+            page.evaluate("() => { document.querySelector('.board').scrollTop = 160; }")
+            page.wait_for_timeout(150)
+
+            session = page.context.new_cdp_session(page)
+            x, y = touch_point(page, page.locator(".task").nth(2).locator(".task__content"), dy=4)
+            self._wait_for_drag_start(page, session, x, y)
+
+            # 手指向下拖：没有拦截的话列表会跟着往上滚（scrollTop 变小）
+            for step in range(1, 9):
+                dispatch_touch(session, "touchMove", [{"x": x, "y": y + step * 18}])
+                page.wait_for_timeout(16)
+            scrolled = page.evaluate("() => Math.round(document.querySelector('.board').scrollTop)")
+            dispatch_touch(session, "touchEnd")
+
+            assert scrolled == 160, f"拖动期间列表不该滚动，scrollTop={scrolled}"
+        finally:
+            page.context.close()
+
+    def test_dragging_card_is_lifted(self, chromium, live_server):
+        """拖动中的卡片要有「拿起来了」的反馈，而且不能撑出横向滚动。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("lift"))
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            resting_shadow = page.evaluate(
+                "() => getComputedStyle(document.querySelector('.task')).boxShadow"
+            )
+
+            session = page.context.new_cdp_session(page)
+            x, y = touch_point(page, page.locator(".task").nth(0).locator(".task__content"), dy=4)
+            self._wait_for_drag_start(page, session, x, y)
+            for step in range(1, 6):
+                dispatch_touch(session, "touchMove", [{"x": x, "y": y + step * 20}])
+                page.wait_for_timeout(16)
+
+            lifted = page.evaluate(
+                """() => {
+                    const el = document.querySelector('.task.is-dragging');
+                    const board = document.querySelector('.board');
+                    const scale = new DOMMatrix(getComputedStyle(el).transform).a;
+                    return {
+                        scale,
+                        shadow: getComputedStyle(el).boxShadow,
+                        boardScrollWidth: board.scrollWidth,
+                        boardClientWidth: board.clientWidth,
+                        pageScrollWidth: document.documentElement.scrollWidth,
+                        innerWidth: window.innerWidth,
+                    };
+                }"""
+            )
+            dispatch_touch(session, "touchEnd")
+            page.wait_for_timeout(250)
+
+            assert lifted["scale"] > 1, f"拖动中的卡片没有放大: {lifted}"
+            assert lifted["shadow"] != resting_shadow, f"拖动中的卡片阴影没变化: {lifted}"
+            assert lifted["boardScrollWidth"] <= lifted["boardClientWidth"], f"拖动撑出了横向滚动: {lifted}"
+            assert lifted["pageScrollWidth"] <= lifted["innerWidth"] + 1, f"页面出现横向滚动: {lifted}"
+            # 松手后不留状态：放大只由 .is-dragging 这条规则给，
+            # FLIP 用的行内 transform 也必须清干净，否则卡片会永久偏移
+            assert page.evaluate("() => document.querySelectorAll('.task.is-dragging').length") == 0
+            assert page.evaluate(
+                "() => [...document.querySelectorAll('.task')].every(el => el.style.transform === '')"
+            )
         finally:
             page.context.close()
 

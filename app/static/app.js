@@ -276,9 +276,10 @@
     grip.setAttribute('tabindex', '-1');
     grip.setAttribute('aria-hidden', 'true');
     grip.innerHTML = GRIP_ICON;
-    // 只在把手上监听按下；move/up/cancel 挂在 document 上（见拖动排序一节），
-    // 因为拖动中卡片会移动，pointer capture 会随之失效
+    // 把手上按下立刻可拖；触摸设备上长按卡片正文也行（见拖动排序一节）。
+    // move/up/cancel 挂在 document 上，因为拖动中卡片会移动、pointer capture 会失效
     grip.addEventListener('pointerdown', gripPointerDown);
+    li.addEventListener('pointerdown', cardPointerDown);
 
     const check = document.createElement('button');
     check.type = 'button';
@@ -486,11 +487,40 @@
    */
 
   const DRAG_THRESHOLD = 8; // 移动超过 8px 才判定为拖动（区分误触）
+  /*
+   * 触摸设备上按住多久算「长按拖动」。取 300ms 是因为它比浏览器的长按选择
+   * （约 500ms）短：手感更利落，也避免浏览器抢先弹出「选择 / 复制」。
+   */
+  const LONG_PRESS_MS = 300;
   const AUTO_SCROLL_ZONE = 48; // 靠近列表上下边缘时自动滚动的触发区
   const AUTO_SCROLL_STEP = 10;
 
-  let dragState = null; // { pointerId, grip, element, started, startX, startY, originalOrder }
+  // { pointerId, handle, element, started, longPress, timer, startX, startY, originalOrder }
+  let dragState = null;
   let autoScrollFrame = null;
+
+  /** 真正进入拖动状态：抬起卡片、禁止选中文字。 */
+  function beginDrag(d) {
+    if (d.started) return;
+    window.clearTimeout(d.timer);
+    d.timer = null;
+    d.started = true;
+    d.originalOrder = Array.from(taskList.children);
+    d.element.classList.add('is-dragging');
+    document.body.classList.add('is-sorting');
+  }
+
+  /** 放弃这次按下（没进入拖动），恢复常态。 */
+  function abortPress(d) {
+    window.clearTimeout(d.timer);
+    d.timer = null;
+    d.element.classList.remove('is-pressed');
+    if (dragState === d) dragState = null;
+  }
+
+  function movedDistance(d, event) {
+    return Math.abs(event.clientX - d.startX) + Math.abs(event.clientY - d.startY);
+  }
 
   function gripPointerDown(event) {
     if (event.pointerType === 'mouse' && event.button !== 0) return;
@@ -504,15 +534,43 @@
     } catch (error) {
       /* capture 失败不影响主流程 */
     }
+    element.classList.add('is-pressed');
     dragState = {
       pointerId: event.pointerId,
-      grip: event.currentTarget,
+      handle: event.currentTarget,
       element: element,
       started: false,
+      longPress: false,
+      timer: null,
       startX: event.clientX,
       startY: event.clientY,
       originalOrder: [],
     };
+  }
+
+  /**
+   * 触摸设备：长按卡片任意位置也能拖动。
+   * 把手只有 14px 宽，手指很难按准，所以整张卡片都是拖动的入口；
+   * 手指一动就取消（那说明用户是在滚动列表），长按计时到点才开始拖。
+   */
+  function cardPointerDown(event) {
+    if (event.pointerType !== 'touch' || dragState) return;
+    if (event.target.closest('button')) return; // 把手 / 勾选 / 圆点 / 按钮各有各的处理
+    const element = event.currentTarget;
+    const d = {
+      pointerId: event.pointerId,
+      handle: null,
+      element: element,
+      started: false,
+      longPress: true,
+      timer: null,
+      startX: event.clientX,
+      startY: event.clientY,
+      originalOrder: [],
+    };
+    element.classList.add('is-pressed');
+    d.timer = window.setTimeout(() => beginDrag(d), LONG_PRESS_MS);
+    dragState = d;
   }
 
   function globalPointerMove(event) {
@@ -520,13 +578,13 @@
     if (!d || d.pointerId !== event.pointerId) return;
 
     if (!d.started) {
-      const moved =
-        Math.abs(event.clientX - d.startX) + Math.abs(event.clientY - d.startY);
-      if (moved < DRAG_THRESHOLD) return;
-      d.started = true;
-      d.originalOrder = Array.from(taskList.children);
-      d.element.classList.add('is-dragging');
-      document.body.classList.add('is-sorting');
+      if (movedDistance(d, event) < DRAG_THRESHOLD) return;
+      // 长按还没到点手指就动了：用户在滚动列表，让给他
+      if (d.longPress) {
+        abortPress(d);
+        return;
+      }
+      beginDrag(d);
     }
 
     event.preventDefault();
@@ -550,8 +608,10 @@
     const d = dragState;
     if (!d || d.pointerId !== event.pointerId) return;
     dragState = null;
+    window.clearTimeout(d.timer);
     stopAutoScroll();
     document.body.classList.remove('is-sorting');
+    d.element.classList.remove('is-pressed');
     if (!d.started) return;
 
     d.element.classList.remove('is-dragging');
@@ -575,6 +635,10 @@
   function cancelDrag() {
     const d = dragState;
     dragState = null;
+    if (d) {
+      window.clearTimeout(d.timer);
+      d.element.classList.remove('is-pressed');
+    }
     stopAutoScroll();
     document.body.classList.remove('is-sorting');
     if (!d || !d.started) return;
@@ -595,9 +659,10 @@
 
     // 卡片移动会把它从文档树摘下再插入，pointer capture 随之释放，
     // 这里重建，让指针移出窗口等边缘情况仍能收到事件
-    if (dragState) {
+    // （长按卡片正文开始的拖动没有把手可捕获，靠 document 级监听就够）
+    if (dragState && dragState.handle) {
       try {
-        dragState.grip.setPointerCapture(dragState.pointerId);
+        dragState.handle.setPointerCapture(dragState.pointerId);
       } catch (error) {
         /* 忽略 */
       }
@@ -753,6 +818,24 @@
   document.addEventListener('pointermove', globalPointerMove);
   document.addEventListener('pointerup', globalPointerUp);
   document.addEventListener('pointercancel', globalPointerCancel);
+
+  /*
+   * 长按拖动期间要挡住列表滚动：只有非 passive 的 touchmove 才能 preventDefault，
+   * 而且必须在手势开始前就注册好 —— 浏览器据此决定「要不要等这段 JS」，
+   * 临时加的监听器已经晚了，preventDefault 会被忽略。
+   */
+  document.addEventListener(
+    'touchmove',
+    (event) => {
+      if (dragState && dragState.started) event.preventDefault();
+    },
+    { passive: false }
+  );
+
+  // 安卓 Chrome 长按会弹上下文菜单，拖动时得拦下来，否则拖动被打断
+  document.addEventListener('contextmenu', (event) => {
+    if (dragState) event.preventDefault();
+  });
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && dragState && dragState.started) {
