@@ -25,6 +25,7 @@
 
 - **拖动排序**：卡片左侧把手按住上下拖即可调整顺序，鼠标和触屏都支持，排序持久化；拖动中按 `Esc` 取消。
 - **颜色标记**：每张卡片有三个红/黄/绿小圆点，点一下标记颜色（左侧色条 + 淡底色），再点同色圆点取消。
+- **更新即时生效**：静态资源 URL 带内容指纹，改完代码重启服务，浏览器自己就会去取新文件，不用让用户清缓存。
 - 深浅色自动跟随系统、手机/平板/电脑自适应、键盘无障碍操作。
 
 ---
@@ -187,6 +188,30 @@ sudo nginx -t && sudo systemctl reload nginx
 走 HTTPS 时**务必**给后端进程设置 `PLAN_COOKIE_SECURE=1`，
 让会话 Cookie 带上 `Secure` 标记。
 
+### 静态资源与浏览器缓存
+
+应用自己下发缓存头，语义是「**指纹对得上就长缓存，否则一律回源校验**」：
+
+| 请求 | 响应头 | 效果 |
+|------|--------|------|
+| `GET /`（首页） | `Cache-Control: no-cache` + `ETag` | 每次都回源校验，内容没变只回一个没有正文的 `304`，变了立刻拿到新的 |
+| `/static/app.js?v=<当前指纹>` | `Cache-Control: public, max-age=31536000, immutable` | 一年内不再询问，直接从本地缓存读 |
+| `/static/app.js` 或指纹已过期 | `Cache-Control: no-cache` | 旧 URL 不会被长期缓存，不会卡在旧文件上 |
+
+首页 HTML 里的资源地址是渲染时算出来的内容指纹（`sha256` 前 8 位），
+**改了文件指纹就变、URL 就变**，所以：
+
+- 发布新版本只需重启服务，**不必手工改版本号**，也不用教用户按 `Ctrl+F5`；
+- 没改到的文件指纹不变，用户不会重复下载（首页 `ETag` 也会跟着资源变化）。
+
+**第一次上这套机制时**，老用户手里可能还压着旧版本发的首页（那时候还没有缓存头），
+他们会在一小段时间内看到旧页面，等浏览器下次回源就自动好了；之后不再有这个问题。
+
+反向代理这一层**不要再自己设缓存**。`deploy/nginx.conf.example` 里的
+`/static/` 只做转发，不加 `expires` / `add_header`——nginx 的 `expires`
+会覆盖上游的 `Cache-Control`，把上面的策略打乱。若前面还挂了 CDN，
+记得让 CDN 别缓存 `/`（`/static/` 带指纹，缓存是安全的）。
+
 ### 配置项
 
 全部通过环境变量覆盖，改完重启进程即可生效。
@@ -221,15 +246,16 @@ sudo nginx -t && sudo systemctl reload nginx
 .venv/bin/python -m pytest
 ```
 
-当前 **263 个用例全部通过**（227 个逻辑/接口用例 + 36 个真实浏览器用例）：
+当前 **287 个用例全部通过**（248 个逻辑/接口用例 + 39 个真实浏览器用例）：
 
 | 文件 | 层次 | 覆盖内容 |
 |------|------|----------|
 | `tests/test_security.py` | 单元 | 口令哈希、加盐、损坏哈希的容错、会话令牌随机性 |
 | `tests/test_repository.py` | 单元 | SQL 层：唯一索引、会话过期、逻辑删除、跨用户不可写、排序与颜色、旧库迁移 |
 | `tests/test_services.py` | 单元 | 业务规则：注册重名、登录校验、内容长度、完成状态幂等、重排与标记色校验 |
+| `tests/test_staticfiles.py` | 单元 | 静态资源指纹：URL 注入、越界路径、缓存头、改文件后 URL 变化 |
 | `tests/test_api.py` | 功能 | 完整 HTTP 流程，对照 9 条需求逐条覆盖，含用户隔离与落库校验 |
-| `tests/test_browser.py` | 功能 | 真实浏览器：响应式布局、删除确认弹窗、完成状态配色、拖动排序、颜色圆点 |
+| `tests/test_browser.py` | 功能 | 真实浏览器：响应式布局、删除确认弹窗、完成状态配色、拖动排序、颜色圆点、静态资源缓存 |
 
 跑单个文件或单个用例：
 
@@ -244,7 +270,8 @@ sudo nginx -t && sudo systemctl reload nginx
 八种视口打开页面，验证：布局不出现横向溢出、底部输入框始终停在视口内、
 触摸设备上操作按钮不依赖 hover 就能点到、点击热区足够大、
 删除确认弹窗的「取消」不删、「确认」才删、
-拖动排序（鼠标拖动、CDP 触摸拖动、Esc 取消、轻点不误触）与颜色圆点标记，等等。
+拖动排序（鼠标拖动、CDP 触摸拖动、Esc 取消、轻点不误触）、颜色圆点标记，
+以及「改完文件重载就拿到新样式」的缓存失效，等等。
 
 需要额外装浏览器和它的系统库：
 
@@ -254,7 +281,7 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo .venv/bin/playwright install-deps chromium   # Chromium 依赖的系统库
 ```
 
-没装的话这 36 个用例会**自动跳过**，不会让 `pytest` 整体失败。
+没装的话这 39 个用例会**自动跳过**，不会让 `pytest` 整体失败。
 
 ---
 
@@ -328,6 +355,7 @@ curl -b /tmp/plan.txt http://127.0.0.1:8000/api/tasks
 │   ├── deps.py          # FastAPI 依赖注入
 │   ├── config.py        # 配置（环境变量）
 │   ├── util.py          # 时间工具
+│   ├── staticfiles.py   # 静态资源的指纹与缓存头
 │   └── static/          # 前端：index.html / style.css / app.js
 ├── tests/               # pytest 测试
 ├── deploy/              # systemd 与 nginx 配置示例
@@ -392,6 +420,15 @@ sqlite3 data/plan.db "SELECT id, user_id, content, completed, sort_order, color,
 命中测试会把不可点击元素上的触摸重定向到附近最近的可点击元素，所以把手
 必须是 `<button>` 而不是 `<div>`；二是拖动中卡片移动会释放 pointer
 capture，所以 move/up/cancel 监听挂在 `document` 上。
+
+**静态资源用内容指纹做缓存失效，而不是手工版本号。** 页面引用的是
+`/static/app.js?v=4b5d8e2d`，这个 8 位十六进制数是文件内容的 `sha256` 前 8 位，
+渲染首页时现算（按 mtime/大小缓存，不会每个请求都重读文件）。选内容指纹而不是
+`__version__` 之类的版本号，是因为版本号要靠人记得改——忘了改就白搭；
+指纹是算出来的，改了就一定变，没改就不变。首页本身 `no-cache` + `ETag`，
+保证用户手里的资源 URL 永远是最新的；指纹对不上的资源（有人直接开旧链接）
+退回 `no-cache`，不会因为「URL 没变」而一直拿到老文件。整套逻辑在
+`app/staticfiles.py`，只有几十行，没有引构建工具或哈希插件。
 
 **颜色存的是枚举字符串，前后端各自兜底。** 后端 pydantic 用 `Literal`
 限定取值，前端渲染类名前再查一次白名单，杜绝把不可信内容拼进 class。

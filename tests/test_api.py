@@ -6,9 +6,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 import pytest
 
 from app import repository
+from app.main import STATIC_DIR
+from app.staticfiles import IMMUTABLE_CACHE
 
 PASSWORD = "secret-123"
 
@@ -31,6 +36,26 @@ class TestStaticPages:
         response = client.get(asset)
         assert response.status_code == 200
         assert len(response.content) > 0
+
+    def test_index_references_assets_with_content_fingerprint(self, client):
+        """首页里引用的静态资源都带内容指纹，改了文件浏览器才会自动取新的。"""
+        html = client.get("/").text
+        referenced = dict(re.findall(r'(?:href|src)="(/static/[^"?]+)\?v=([0-9a-f]+)"', html))
+        assert set(referenced) == {"/static/style.css", "/static/app.js"}
+        for url, version in referenced.items():
+            path = STATIC_DIR / url.removeprefix("/static/")
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
+            assert version == expected, f"{url} 的指纹和文件内容对不上"
+
+    def test_cache_headers_follow_the_fingerprint(self, client):
+        index = client.get("/")
+        assert index.headers["cache-control"] == "no-cache"
+
+        versioned = re.search(r"/static/style\.css\?v=[0-9a-f]+", index.text).group(0)
+        assert client.get(versioned).headers["cache-control"] == IMMUTABLE_CACHE
+        # 没带指纹 / 指纹是旧的：不长缓存，免得旧 URL 一直拿到老内容
+        assert client.get("/static/style.css").headers["cache-control"] == "no-cache"
+        assert client.get("/static/style.css", params={"v": "0" * 8}).headers["cache-control"] == "no-cache"
 
     def test_health(self, client):
         response = client.get("/api/health")

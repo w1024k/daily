@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
+import shutil
 import socket
 import threading
 import time
@@ -25,7 +27,8 @@ pytest.importorskip("playwright.sync_api", reason="需要先安装 playwright")
 from playwright.sync_api import expect, sync_playwright  # noqa: E402
 
 from app.config import Settings  # noqa: E402
-from app.main import create_app  # noqa: E402
+from app.main import STATIC_DIR, create_app  # noqa: E402
+from app.staticfiles import IMMUTABLE_CACHE  # noqa: E402
 
 # 常见设备视口
 PHONE = {"width": 390, "height": 844}   # iPhone 14
@@ -57,17 +60,12 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def live_server(tmp_path_factory):
+@contextlib.contextmanager
+def _serve(app):
+    """真起一个 uvicorn，返回可访问的 base_url。"""
     import uvicorn
 
-    settings = Settings(
-        db_path=str(tmp_path_factory.mktemp("browser") / "browser.db"),
-        password_iterations=1000,
-    )
-    app = create_app(settings)
     port = _free_port()
-
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -84,10 +82,35 @@ def live_server(tmp_path_factory):
     else:  # pragma: no cover
         raise RuntimeError("测试服务启动超时")
 
-    yield base_url
+    try:
+        yield base_url
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
 
-    server.should_exit = True
-    thread.join(timeout=5)
+
+@pytest.fixture(scope="module")
+def live_server(tmp_path_factory):
+    settings = Settings(
+        db_path=str(tmp_path_factory.mktemp("browser") / "browser.db"),
+        password_iterations=1000,
+    )
+    with _serve(create_app(settings)) as base_url:
+        yield base_url
+
+
+@pytest.fixture(scope="module")
+def mutable_static_server(tmp_path_factory):
+    """静态目录是临时副本，用例里可以改文件，用来模拟「发了一版新代码」。
+
+    返回 (base_url, 静态目录)。
+    """
+    root = tmp_path_factory.mktemp("mutable-static")
+    static_dir = root / "static"
+    shutil.copytree(STATIC_DIR, static_dir)
+    settings = Settings(db_path=str(root / "mutable.db"), password_iterations=1000)
+    with _serve(create_app(settings, static_dir=static_dir)) as base_url:
+        yield base_url, static_dir
 
 
 @pytest.fixture(scope="module")
@@ -812,5 +835,72 @@ class TestColorDots:
 
             row.locator(".task__action[data-action='delete']").click()
             expect(page.locator("#modal")).to_be_visible()
+        finally:
+            page.context.close()
+
+
+# --------------------------------------------------------------------------
+# 静态资源缓存：更新后浏览器要自动取新文件
+# --------------------------------------------------------------------------
+
+
+class TestStaticCacheBusting:
+    """资源 URL 带内容指纹，所以可以放心长缓存，改代码后又不会卡在旧文件上。"""
+
+    def test_page_asks_for_versioned_assets(self, chromium, live_server):
+        page = _new_page(chromium, DESKTOP)
+        try:
+            with page.expect_response(lambda r: "/static/style.css" in r.url) as info:
+                page.goto(live_server)
+            assert re.search(r"/static/style\.css\?v=[0-9a-f]{8}$", info.value.url)
+            # 带指纹的资源才允许被长期缓存
+            assert info.value.headers.get("cache-control") == IMMUTABLE_CACHE
+
+            assert re.search(
+                r"/static/app\.js\?v=[0-9a-f]{8}$",
+                page.get_attribute('script[src^="/static/"]', "src"),
+            )
+        finally:
+            page.context.close()
+
+    def test_versioned_stylesheet_is_really_applied(self, chromium, live_server):
+        """URL 变了不能把 CSS 请求搞坏（404/错误 MIME 都会让页面没样式）。"""
+        page = _new_page(chromium, DESKTOP)
+        try:
+            page.goto(live_server)
+            expect(page.locator("#auth-view")).to_be_visible()
+            rules = page.evaluate(
+                """() => [...document.styleSheets]
+                    .filter(sheet => (sheet.href || '').includes('style.css'))
+                    .map(sheet => sheet.cssRules.length)"""
+            )
+            assert rules and rules[0] > 0
+        finally:
+            page.context.close()
+
+    def test_updated_file_is_picked_up_without_clearing_cache(self, chromium, mutable_static_server):
+        """改一次 style.css：同一个浏览器上下文重载就能拿到新样式。"""
+        base_url, static_dir = mutable_static_server
+        page = _new_page(chromium, DESKTOP)
+        requested: list[str] = []
+        page.on("request", lambda r: requested.append(r.url) if "style.css" in r.url else None)
+        try:
+            page.goto(base_url)
+            expect(page.locator("#auth-view")).to_be_visible()
+            first_url = requested[-1]
+
+            css = static_dir / "style.css"
+            css.write_text(
+                css.read_text(encoding="utf-8") + "\n.auth__card { background-color: rgb(1, 2, 3) !important; }\n",
+                encoding="utf-8",
+            )
+
+            page.reload()
+            expect(page.locator("#auth-view")).to_be_visible()
+            assert requested[-1] != first_url, "浏览器还在用旧 URL，等于拿了缓存里的旧文件"
+            background = page.evaluate(
+                "() => getComputedStyle(document.querySelector('.auth__card')).backgroundColor"
+            )
+            assert background == "rgb(1, 2, 3)"
         finally:
             page.context.close()

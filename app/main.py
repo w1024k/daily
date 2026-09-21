@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from . import __version__, services
 from .config import Settings
@@ -30,6 +29,7 @@ from .schemas import (
     TaskUpdateRequest,
     UserOut,
 )
+from .staticfiles import StaticAssets, VersionedStaticFiles
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -51,9 +51,10 @@ def _clear_session_cookie(response: Response, settings: Settings) -> None:
     response.delete_cookie(key=settings.cookie_name, path="/")
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, static_dir: Path | str | None = None) -> FastAPI:
     settings = settings or Settings()
     database = Database(settings.db_path)
+    assets = StaticAssets(static_dir or STATIC_DIR)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -214,12 +215,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------
     # 静态页面
+    #
+    # 首页里的资源 URL 带内容指纹（/static/app.js?v=xxxxxxxx），
+    # 文件一改指纹就变，浏览器不会再拿到旧缓存，见 staticfiles.py。
     # ------------------------------------------------------------------
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", VersionedStaticFiles(assets), name="static")
 
     @app.get("/", include_in_schema=False)
-    def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+    def index(request: Request) -> Response:
+        return assets.index_response(request)
 
     return app
 

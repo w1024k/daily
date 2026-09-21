@@ -33,12 +33,12 @@ server {
     # 任务内容是用户输入，限制一下请求体大小
     client_max_body_size 64k;
 
-    # 静态资源加个缓存
+    # 静态资源的缓存策略由应用下发（URL 带内容指纹 -> 长期缓存，首页 -> 回源校验），
+    # 这里只做转发。别加 expires / add_header Cache-Control：
+    # nginx 的 expires 会盖掉上游的 Cache-Control，更新后用户就可能拿到旧文件。
     location /static/ {
         proxy_pass http://plan_manager;
         proxy_set_header Host $host;
-        expires 7d;
-        add_header Cache-Control "public";
     }
 
     location / {
