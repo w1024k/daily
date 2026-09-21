@@ -26,6 +26,7 @@ from .schemas import (
     TaskCreateRequest,
     TaskListOut,
     TaskOut,
+    TaskReorderRequest,
     TaskUpdateRequest,
     UserOut,
 )
@@ -163,11 +164,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return services.add_task(conn, user["id"], payload.content)
 
+    @app.put(
+        "/api/tasks/order",
+        status_code=status.HTTP_204_NO_CONTENT,
+        tags=["任务"],
+        summary="拖动排序（整体重排）",
+    )
+    def reorder_tasks(
+        payload: TaskReorderRequest,
+        user: dict[str, Any] = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> Response:
+        services.reorder_tasks(conn, user["id"], payload.ids)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.patch(
         "/api/tasks/{task_id}",
         response_model=TaskOut,
         tags=["任务"],
-        summary="标记完成 / 取消完成",
+        summary="标记完成 / 取消完成 / 设置标记色",
     )
     def update_task(
         task_id: int,
@@ -175,7 +190,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: dict[str, Any] = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
-        return services.set_task_completed(conn, user["id"], task_id, payload.completed)
+        if not payload.model_fields_set:
+            raise services.ValidationFailed("至少需要提供一个要修改的字段")
+        if "completed" in payload.model_fields_set and payload.completed is not None:
+            services.set_task_completed(conn, user["id"], task_id, payload.completed)
+        if "color" in payload.model_fields_set:
+            services.set_task_color(conn, user["id"], task_id, payload.color)
+        return services.get_task(conn, user["id"], task_id)
 
     @app.delete(
         "/api/tasks/{task_id}",

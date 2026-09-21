@@ -18,6 +18,7 @@ MIN_USERNAME_LENGTH = 2
 MIN_PASSWORD_LENGTH = 6
 MAX_PASSWORD_LENGTH = 128
 MAX_CONTENT_LENGTH = 200
+TASK_COLORS = ("red", "yellow", "green")
 
 
 class ServiceError(Exception):
@@ -226,3 +227,37 @@ def delete_task(conn: sqlite3.Connection, user_id: int, task_id: int) -> None:
         changed = repository.soft_delete_task(conn, task_id, user_id, now_iso())
     if changed == 0:
         raise NotFound()
+
+
+def set_task_color(conn: sqlite3.Connection, user_id: int, task_id: int, color: Any) -> dict[str, Any]:
+    """设置 / 清除任务标记色，返回更新后的任务。"""
+    if color is not None and color not in TASK_COLORS:
+        raise ValidationFailed("无效的标记颜色")
+    with conn:
+        changed = repository.set_task_color(conn, task_id, user_id, color)
+    if changed == 0:
+        raise NotFound()
+    return get_task(conn, user_id, task_id)
+
+
+def reorder_tasks(conn: sqlite3.Connection, user_id: int, ordered_ids: Any) -> None:
+    """按给定 id 顺序重排任务。id 集合必须与当前任务完全一致，否则视为
+    客户端数据过期，返回 422 让前端刷新。
+    """
+    if not isinstance(ordered_ids, list) or not ordered_ids:
+        raise ValidationFailed("排序列表不能为空")
+    if any(not isinstance(task_id, int) or isinstance(task_id, bool) for task_id in ordered_ids):
+        raise ValidationFailed("排序列表格式不正确")
+    if len(set(ordered_ids)) != len(ordered_ids):
+        raise ValidationFailed("排序列表中有重复任务")
+
+    current_ids = {task["id"] for task in repository.list_tasks(conn, user_id)}
+    if set(ordered_ids) != current_ids:
+        raise ValidationFailed("排序与当前任务不一致，请刷新后重试")
+
+    if len(ordered_ids) == 1:
+        return  # 只有一条任务，无需写入
+    with conn:
+        if not repository.reorder_tasks(conn, user_id, ordered_ids):
+            # 校验之后任务被并发删除等极端情况：回滚并提示刷新
+            raise ValidationFailed("排序与当前任务不一致，请刷新后重试")

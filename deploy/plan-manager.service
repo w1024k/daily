@@ -18,11 +18,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=root
+Group=root
 WorkingDirectory=/data/code/daily
 
-Environment=PLAN_DB_PATH=/var/lib/plan-manager/plan.db
 # 0.0.0.0 = 监听所有网卡（局域网/公网可直接访问）
 # 只想本机访问就改回 127.0.0.1，并配合 Nginx 反向代理对外
 Environment=PLAN_HOST=0.0.0.0
@@ -36,12 +35,6 @@ ExecStart=/data/code/daily/.venv/bin/uvicorn app.main:app \
 Restart=on-failure
 RestartSec=3
 
-# 基础加固
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/plan-manager
 
 [Install]
 WantedBy=multi-user.target

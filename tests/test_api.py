@@ -473,3 +473,109 @@ class TestSchemaIntegrity:
             conn.close()
 
         assert remaining == 0
+
+
+class TestTaskColor:
+    def test_set_color_and_see_it_in_list(self, alice):
+        task_id = alice.post("/api/tasks", json={"content": "需要重点跟进"}).json()["id"]
+        body = alice.patch(f"/api/tasks/{task_id}", json={"color": "red"}).json()
+        assert body["color"] == "red"
+
+        tasks = alice.get("/api/tasks").json()["tasks"]
+        assert tasks[0]["id"] == task_id
+        assert tasks[0]["color"] == "red"
+
+    def test_clear_color_with_null(self, alice):
+        task_id = alice.post("/api/tasks", json={"content": "先标绿再清除"}).json()["id"]
+        alice.patch(f"/api/tasks/{task_id}", json={"color": "green"})
+        body = alice.patch(f"/api/tasks/{task_id}", json={"color": None}).json()
+        assert body["color"] is None
+
+    def test_new_task_has_no_color(self, alice):
+        body = alice.post("/api/tasks", json={"content": "无标记"}).json()
+        assert body["color"] is None
+
+    @pytest.mark.parametrize("bad", ["blue", "RED", "", 3, True, ["red"]])
+    def test_invalid_color_rejected(self, alice, bad):
+        task_id = alice.post("/api/tasks", json={"content": "任务"}).json()["id"]
+        assert alice.patch(f"/api/tasks/{task_id}", json={"color": bad}).status_code == 422
+
+    def test_color_survives_completed_toggle(self, alice):
+        """PATCH 只传 completed 时不能动标记色。"""
+        task_id = alice.post("/api/tasks", json={"content": "标黄后完成"}).json()["id"]
+        alice.patch(f"/api/tasks/{task_id}", json={"color": "yellow"})
+        done = alice.patch(f"/api/tasks/{task_id}", json={"completed": True}).json()
+        assert done["completed"] is True
+        assert done["color"] == "yellow"
+
+    def test_completed_and_color_can_update_together(self, alice):
+        task_id = alice.post("/api/tasks", json={"content": "一次改两样"}).json()["id"]
+        body = alice.patch(f"/api/tasks/{task_id}", json={"completed": True, "color": "green"}).json()
+        assert body["completed"] is True
+        assert body["color"] == "green"
+
+    def test_empty_patch_rejected(self, alice):
+        task_id = alice.post("/api/tasks", json={"content": "任务"}).json()["id"]
+        assert alice.patch(f"/api/tasks/{task_id}", json={}).status_code == 422
+
+    def test_null_completed_still_rejected(self, alice):
+        """completed 传 null 没有意义，仍然 422（与 color 不同，后者 null = 清除）。"""
+        task_id = alice.post("/api/tasks", json={"content": "任务"}).json()["id"]
+        assert alice.patch(f"/api/tasks/{task_id}", json={"completed": None}).status_code == 422
+
+    def test_missing_task_is_404(self, alice):
+        assert alice.patch("/api/tasks/999999", json={"color": "red"}).status_code == 404
+
+
+class TestTaskReorder:
+    def _make(self, client, contents):
+        return [client.post("/api/tasks", json={"content": c}).json()["id"] for c in contents]
+
+    def test_reorder_and_persist(self, alice):
+        ids = self._make(alice, ["第一件", "第二件", "第三件"])
+        # 当前展示顺序 [第三件, 第二件, 第一件] -> 改成 [第一件, 第三件, 第二件]
+        response = alice.put("/api/tasks/order", json={"ids": [ids[0], ids[2], ids[1]]})
+        assert response.status_code == 204
+        tasks = alice.get("/api/tasks").json()["tasks"]
+        assert [t["id"] for t in tasks] == [ids[0], ids[2], ids[1]]
+
+    def test_reorder_requires_exact_set(self, alice):
+        ids = self._make(alice, ["第一件", "第二件"])
+        # 少一个
+        assert alice.put("/api/tasks/order", json={"ids": [ids[0]]}).status_code == 422
+        # 多一个不存在的
+        assert alice.put("/api/tasks/order", json={"ids": [ids[0], ids[1], 9999]}).status_code == 422
+        # 失败后顺序不变
+        tasks = alice.get("/api/tasks").json()["tasks"]
+        assert [t["content"] for t in tasks] == ["第二件", "第一件"]
+
+    def test_reorder_rejects_duplicates(self, alice):
+        ids = self._make(alice, ["第一件", "第二件"])
+        assert alice.put("/api/tasks/order", json={"ids": [ids[0], ids[0]]}).status_code == 422
+
+    def test_reorder_rejects_other_users_task(self, alice, register):
+        bob = register("bob")
+        mine = self._make(alice, ["我的任务"])[0]
+        theirs = self._make(bob, ["他的任务"])[0]
+        assert alice.put("/api/tasks/order", json={"ids": [mine, theirs]}).status_code == 422
+
+    def test_reorder_rejects_deleted_task(self, alice):
+        ids = self._make(alice, ["第一件", "第二件"])
+        alice.delete(f"/api/tasks/{ids[1]}")
+        assert alice.put("/api/tasks/order", json={"ids": [ids[0], ids[1]]}).status_code == 422
+
+    def test_reorder_rejects_empty_list(self, alice):
+        self._make(alice, ["第一件"])
+        assert alice.put("/api/tasks/order", json={"ids": []}).status_code == 422
+
+    def test_reorder_single_task_is_noop(self, alice):
+        ids = self._make(alice, ["唯一"])
+        assert alice.put("/api/tasks/order", json={"ids": ids}).status_code == 204
+        assert [t["id"] for t in alice.get("/api/tasks").json()["tasks"]] == ids
+
+    def test_reorder_requires_auth(self, client):
+        assert client.put("/api/tasks/order", json={"ids": [1]}).status_code == 401
+
+    def test_reorder_rejects_non_int_ids(self, alice):
+        ids = self._make(alice, ["第一件", "第二件"])
+        assert alice.put("/api/tasks/order", json={"ids": ["1", "2"]}).status_code == 422

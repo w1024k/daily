@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated, Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 from . import services
@@ -50,13 +52,35 @@ class TaskCreateRequest(BaseModel):
 
 
 class TaskUpdateRequest(BaseModel):
-    """目前只支持切换完成状态。
+    """PATCH 语义的部分更新：completed 切完成状态，color 设标记色。
+
+    两个字段都可选；用 ``model_fields_set`` 区分「未提供」和「提供 null」，
+    后者对 color 表示清除标记色。
 
     ``strict=True``：只接受真正的 JSON 布尔值，避免 "yes" / 1 / "false"
     被宽松地转换成 bool，接口契约更明确。
     """
 
-    completed: bool = Field(strict=True)
+    completed: bool | None = Field(default=None, strict=True)
+    color: Literal["red", "yellow", "green"] | None = None
+
+    @field_validator("completed")
+    @classmethod
+    def completed_must_be_bool(cls, value: bool | None) -> bool | None:
+        # 字段缺省时不经过校验器；这里只拦住显式传 null 的请求。
+        # 想表达「不修改」直接不传该字段即可。
+        if value is None:
+            raise ValueError("completed 必须是布尔值")
+        return value
+
+
+class TaskReorderRequest(BaseModel):
+    """整体排序：ids 的顺序即新的展示顺序（第一项在最前面）。
+
+    元素用 strict int：不接受 "1" / true 这类会被悄悄转换的值。
+    """
+
+    ids: list[Annotated[int, Field(strict=True)]]
 
 
 class TaskOut(BaseModel):
@@ -65,6 +89,7 @@ class TaskOut(BaseModel):
     completed: bool
     created_at: str
     completed_at: str | None = None
+    color: Literal["red", "yellow", "green"] | None = None
 
 
 class TaskListOut(BaseModel):

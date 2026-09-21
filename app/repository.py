@@ -35,6 +35,7 @@ def task_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "completed": completed,
         "created_at": row["created_at"],
         "completed_at": row["completed_at"] if completed else None,
+        "color": row["color"] if "color" in row.keys() else None,
     }
 
 
@@ -103,26 +104,39 @@ def delete_expired_sessions(conn: sqlite3.Connection, now: str) -> int:
 # 任务
 # --------------------------------------------------------------------------
 
-_TASK_COLUMNS = "id, user_id, content, completed, created_at, completed_at, deleted_at"
+_TASK_COLUMNS = "id, user_id, content, completed, created_at, completed_at, deleted_at, sort_order, color"
 
 
 def create_task(conn: sqlite3.Connection, user_id: int, content: str, created_at: str) -> dict[str, Any]:
+    """新任务排在列表最前面：sort_order 取当前用户最大值 + 1。
+
+    同一秒内连续新增也能保证顺序稳定（created_at 只精确到秒，靠不住）。
+    """
     cursor = conn.execute(
-        "INSERT INTO tasks (user_id, content, completed, created_at) VALUES (?, ?, 0, ?)",
-        (user_id, content, created_at),
+        """
+        INSERT INTO tasks (user_id, content, completed, created_at, sort_order)
+        VALUES (
+            ?, ?, 0, ?,
+            (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tasks WHERE user_id = ?)
+        )
+        """,
+        (user_id, content, created_at, user_id),
     )
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (cursor.lastrowid,)).fetchone()
     return task_to_dict(row)
 
 
 def list_tasks(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
-    """当前用户未删除的任务，最新的排在最前面。"""
+    """当前用户未删除的任务，按用户拖动的顺序（sort_order 越大越靠前）。
+
+    id 兜底：sort_order 相同（理论上是旧数据回填撞值）时新的在前。
+    """
     rows = conn.execute(
         f"""
         SELECT {_TASK_COLUMNS}
         FROM tasks
         WHERE user_id = ? AND deleted_at IS NULL
-        ORDER BY id DESC
+        ORDER BY sort_order DESC, id DESC
         """,
         (user_id,),
     ).fetchall()
@@ -167,3 +181,37 @@ def soft_delete_task(conn: sqlite3.Connection, task_id: int, user_id: int, delet
         (deleted_at, task_id, user_id),
     )
     return cursor.rowcount
+
+
+def set_task_color(conn: sqlite3.Connection, task_id: int, user_id: int, color: str | None) -> int:
+    """设置 / 清除任务标记色。返回受影响行数。"""
+    cursor = conn.execute(
+        """
+        UPDATE tasks
+        SET color = ?
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+        """,
+        (color, task_id, user_id),
+    )
+    return cursor.rowcount
+
+
+def reorder_tasks(conn: sqlite3.Connection, user_id: int, ordered_ids: list[int]) -> bool:
+    """按给定顺序重写 sort_order（必须在事务中调用，由调用方 ``with conn``）。
+
+    列表里第 0 项排最前面，对应最大的 sort_order。任何一条更新失败
+    （任务已删除 / 不属于该用户）返回 False，调用方应回滚。
+    """
+    total = len(ordered_ids)
+    for position, task_id in enumerate(ordered_ids):
+        cursor = conn.execute(
+            """
+            UPDATE tasks
+            SET sort_order = ?
+            WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+            """,
+            (total - position, task_id, user_id),
+        )
+        if cursor.rowcount != 1:
+            return False
+    return True

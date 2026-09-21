@@ -549,3 +549,268 @@ class TestUserIsolationInBrowser:
         finally:
             alice_page.context.close()
             bob_page.context.close()
+
+
+class TestDragAndReorder:
+    """任务卡片上下拖动排序：鼠标与触摸都要能用，顺序要持久化。"""
+
+    def _drag_grip(self, page, source_index, target_index):
+        """把第 source_index 张卡片拖到第 target_index 张卡片之后（鼠标）。"""
+        source = page.locator(".task").nth(source_index)
+        grip = source.locator(".task__grip")
+        box = grip.bounding_box()
+        target_box = page.locator(".task").nth(target_index).bounding_box()
+        x = box["x"] + box["width"] / 2
+        start_y = box["y"] + box["height"] / 2
+        end_y = target_box["y"] + target_box["height"] - 4  # 越过最后一张的中线
+
+        page.mouse.move(x, start_y)
+        page.mouse.down()
+        page.mouse.move(x, end_y, steps=15)
+        page.mouse.up()
+
+    def test_drag_reorders_and_persists(self, chromium, live_server):
+        page = _new_page(chromium, DESKTOP)
+        try:
+            sign_up(page, live_server, unique_username("drag"))
+            # 新任务在前：添加完展示顺序是 [第三条, 第二条, 第一条]
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            # 把最上面的「第三条」拖到最下面
+            with page.expect_response(
+                lambda resp: resp.request.method == "PUT" and resp.url.endswith("/api/tasks/order")
+            ):
+                self._drag_grip(page, 0, 2)
+
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第一条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+
+            # 刷新后顺序不变（已持久化到服务端）
+            page.reload()
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+        finally:
+            page.context.close()
+
+    def test_drag_up_puts_task_before(self, chromium, live_server):
+        page = _new_page(chromium, DESKTOP)
+        try:
+            sign_up(page, live_server, unique_username("dragup"))
+            # 展示顺序 [第三条, 第二条, 第一条]
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            with page.expect_response(
+                lambda resp: resp.request.method == "PUT" and resp.url.endswith("/api/tasks/order")
+            ):
+                # 把最下面的「第一条」拖到最前：越过第一张的中线即可
+                source = page.locator(".task").nth(2)
+                grip = source.locator(".task__grip")
+                box = grip.bounding_box()
+                first_box = page.locator(".task").nth(0).bounding_box()
+                x = box["x"] + box["width"] / 2
+                page.mouse.move(x, box["y"] + box["height"] / 2)
+                page.mouse.down()
+                page.mouse.move(x, first_box["y"] - 6, steps=15)
+                page.mouse.up()
+
+            expect(page.locator(".task").nth(0)).to_contain_text("第一条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第三条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第二条")
+        finally:
+            page.context.close()
+
+    def test_drag_with_touch(self, chromium, live_server):
+        """Pointer Events 在触屏（pointerType=touch）下同样可用。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("touchdrag"))
+            # 展示顺序 [第三条, 第二条, 第一条]
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            grip = page.locator(".task").nth(0).locator(".task__grip")
+            box = grip.bounding_box()
+            target_box = page.locator(".task").nth(2).bounding_box()
+            x = box["x"] + box["width"] / 2
+            start_y = box["y"] + box["height"] / 2
+            end_y = target_box["y"] + target_box["height"] - 4
+
+            session = page.context.new_cdp_session(page)
+            with page.expect_response(
+                lambda resp: resp.request.method == "PUT" and resp.url.endswith("/api/tasks/order")
+            ):
+                session.send("Input.dispatchTouchEvent", {
+                    "type": "touchStart", "touchPoints": [{"x": x, "y": start_y}],
+                })
+                for step in range(1, 11):
+                    y = start_y + (end_y - start_y) * step / 10
+                    session.send("Input.dispatchTouchEvent", {
+                        "type": "touchMove", "touchPoints": [{"x": x, "y": y}],
+                    })
+                session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第一条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+
+            page.reload()
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第三条")
+        finally:
+            page.context.close()
+
+    def test_escape_cancels_drag(self, chromium, live_server):
+        page = _new_page(chromium, DESKTOP)
+        try:
+            sign_up(page, live_server, unique_username("escdrag"))
+            # 登录页加载时 /api/auth/me 的 401 是预期内的，清掉再断言
+            page.console_errors.clear()
+            # 展示顺序 [第三条, 第二条, 第一条]
+            for content in ["第一条", "第二条", "第三条"]:
+                add_task(page, content)
+
+            grip = page.locator(".task").nth(0).locator(".task__grip")
+            box = grip.bounding_box()
+            target_box = page.locator(".task").nth(2).bounding_box()
+            x = box["x"] + box["width"] / 2
+            page.mouse.move(x, box["y"] + box["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(x, target_box["y"] + target_box["height"] - 4, steps=8)
+            page.keyboard.press("Escape")
+            page.mouse.up()
+            page.wait_for_timeout(300)
+
+            # 顺序回到拖动前（也没有向服务端提交排序）
+            expect(page.locator(".task").nth(0)).to_contain_text("第三条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(2)).to_contain_text("第一条")
+
+            page.reload()
+            expect(page.locator(".task").nth(0)).to_contain_text("第三条")
+            assert page.console_errors == [], f"页面报错: {page.console_errors}"
+        finally:
+            page.context.close()
+
+    def test_tap_on_grip_does_not_move(self, chromium, live_server):
+        """在把手上轻点（移动不超过阈值）不应触发排序。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("griptap"))
+            # 展示顺序 [第二条, 第一条]
+            for content in ["第一条", "第二条"]:
+                add_task(page, content)
+
+            grip = page.locator(".task").nth(0).locator(".task__grip")
+            box = grip.bounding_box()
+            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(box["x"] + box["width"] / 2 + 3, box["y"] + box["height"] / 2 + 3)
+            page.mouse.up()
+            page.wait_for_timeout(300)
+
+            expect(page.locator(".task").nth(0)).to_contain_text("第二条")
+            expect(page.locator(".task").nth(1)).to_contain_text("第一条")
+        finally:
+            page.context.close()
+
+
+class TestColorDots:
+    """红黄绿圆点：点击标记颜色、再点取消、刷新后保持。"""
+
+    COLOR_CLASSES = {
+        "red": re.compile(r"\btask--red\b"),
+        "yellow": re.compile(r"\btask--yellow\b"),
+        "green": re.compile(r"\btask--green\b"),
+    }
+
+    def test_dot_marks_card_and_persists(self, chromium, live_server):
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("color"))
+            add_task(page, "需要重点跟进的事")
+
+            row = task_row(page, "需要重点跟进的事")
+            row.locator('.task__color[data-color="red"]').click()
+            expect(row).to_have_class(self.COLOR_CLASSES["red"])
+            expect(row.locator('.task__color[data-color="red"]')).to_have_class(re.compile(r"is-active"))
+
+            # 刷新后颜色还在（已持久化）
+            page.reload()
+            row = task_row(page, "需要重点跟进的事")
+            expect(row).to_have_class(self.COLOR_CLASSES["red"])
+        finally:
+            page.context.close()
+
+    def test_dot_switches_color(self, chromium, live_server):
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("color2"))
+            add_task(page, "先红后绿")
+
+            row = task_row(page, "先红后绿")
+            row.locator('.task__color[data-color="red"]').click()
+            expect(row).to_have_class(self.COLOR_CLASSES["red"])
+
+            row.locator('.task__color[data-color="green"]').click()
+            expect(row).to_have_class(self.COLOR_CLASSES["green"])
+            expect(row).not_to_have_class(self.COLOR_CLASSES["red"])
+            # 只有绿色圆点处于激活态
+            expect(row.locator('.task__color[data-color="green"]')).to_have_class(re.compile(r"is-active"))
+            expect(row.locator('.task__color[data-color="red"]')).not_to_have_class(re.compile(r"is-active"))
+        finally:
+            page.context.close()
+
+    def test_clicking_same_dot_clears_color(self, chromium, live_server):
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("color3"))
+            add_task(page, "标黄再取消")
+
+            row = task_row(page, "标黄再取消")
+            yellow = row.locator('.task__color[data-color="yellow"]')
+            yellow.click()
+            expect(row).to_have_class(self.COLOR_CLASSES["yellow"])
+
+            yellow.click()  # 再点一次 = 取消
+            expect(row).not_to_have_class(self.COLOR_CLASSES["yellow"])
+
+            page.reload()
+            row = task_row(page, "标黄再取消")
+            expect(row).not_to_have_class(self.COLOR_CLASSES["yellow"])
+        finally:
+            page.context.close()
+
+    def test_color_survives_completed_toggle(self, chromium, live_server):
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("color4"))
+            add_task(page, "标色后完成")
+
+            row = task_row(page, "标色后完成")
+            row.locator('.task__color[data-color="green"]').click()
+            expect(row).to_have_class(self.COLOR_CLASSES["green"])
+
+            row.locator(".task__action[data-action='toggle']").click()
+            expect(row).to_have_class(DONE_CLASS)
+            expect(row).to_have_class(self.COLOR_CLASSES["green"])
+        finally:
+            page.context.close()
+
+    def test_dots_do_not_steal_other_clicks(self, chromium, live_server):
+        """圆点扩大的热区不能挡住旁边的完成/删除按钮。"""
+        page = _new_page(chromium, PHONE, touch=True)
+        try:
+            sign_up(page, live_server, unique_username("color5"))
+            add_task(page, "按钮还能点")
+
+            row = task_row(page, "按钮还能点")
+            row.locator(".task__action[data-action='toggle']").click()
+            expect(row).to_have_class(DONE_CLASS)
+
+            row.locator(".task__action[data-action='delete']").click()
+            expect(page.locator("#modal")).to_be_visible()
+        finally:
+            page.context.close()

@@ -21,7 +21,11 @@
 | 8 | 可逆操作 | 已完成的任务支持「取消完成」和删除 |
 | 9 | 逻辑删除 | 删除只打 `deleted_at` 标记，数据行保留 |
 
-其他：深浅色自动跟随系统、手机/平板/电脑自适应、键盘无障碍操作。
+其他：
+
+- **拖动排序**：卡片左侧把手按住上下拖即可调整顺序，鼠标和触屏都支持，排序持久化；拖动中按 `Esc` 取消。
+- **颜色标记**：每张卡片有三个红/黄/绿小圆点，点一下标记颜色（左侧色条 + 淡底色），再点同色圆点取消。
+- 深浅色自动跟随系统、手机/平板/电脑自适应、键盘无障碍操作。
 
 ---
 
@@ -217,15 +221,15 @@ sudo nginx -t && sudo systemctl reload nginx
 .venv/bin/python -m pytest
 ```
 
-当前 **194 个用例全部通过**（168 个逻辑/接口用例 + 26 个真实浏览器用例）：
+当前 **263 个用例全部通过**（227 个逻辑/接口用例 + 36 个真实浏览器用例）：
 
 | 文件 | 层次 | 覆盖内容 |
 |------|------|----------|
 | `tests/test_security.py` | 单元 | 口令哈希、加盐、损坏哈希的容错、会话令牌随机性 |
-| `tests/test_repository.py` | 单元 | SQL 层：唯一索引、会话过期、逻辑删除、跨用户不可写 |
-| `tests/test_services.py` | 单元 | 业务规则：注册重名、登录校验、内容长度、完成状态幂等 |
+| `tests/test_repository.py` | 单元 | SQL 层：唯一索引、会话过期、逻辑删除、跨用户不可写、排序与颜色、旧库迁移 |
+| `tests/test_services.py` | 单元 | 业务规则：注册重名、登录校验、内容长度、完成状态幂等、重排与标记色校验 |
 | `tests/test_api.py` | 功能 | 完整 HTTP 流程，对照 9 条需求逐条覆盖，含用户隔离与落库校验 |
-| `tests/test_browser.py` | 功能 | 真实浏览器：响应式布局、删除确认弹窗、完成状态配色与交互 |
+| `tests/test_browser.py` | 功能 | 真实浏览器：响应式布局、删除确认弹窗、完成状态配色、拖动排序、颜色圆点 |
 
 跑单个文件或单个用例：
 
@@ -239,7 +243,8 @@ sudo nginx -t && sudo systemctl reload nginx
 `tests/test_browser.py` 会用真实 Chromium，以 320 / 360 / 390 / 430 / 768 / 1024 / 1440 / 1920
 八种视口打开页面，验证：布局不出现横向溢出、底部输入框始终停在视口内、
 触摸设备上操作按钮不依赖 hover 就能点到、点击热区足够大、
-删除确认弹窗的「取消」不删、「确认」才删，等等。
+删除确认弹窗的「取消」不删、「确认」才删、
+拖动排序（鼠标拖动、CDP 触摸拖动、Esc 取消、轻点不误触）与颜色圆点标记，等等。
 
 需要额外装浏览器和它的系统库：
 
@@ -249,7 +254,7 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo .venv/bin/playwright install-deps chromium   # Chromium 依赖的系统库
 ```
 
-没装的话这 26 个用例会**自动跳过**，不会让 `pytest` 整体失败。
+没装的话这 36 个用例会**自动跳过**，不会让 `pytest` 整体失败。
 
 ---
 
@@ -264,9 +269,10 @@ sudo .venv/bin/playwright install-deps chromium   # Chromium 依赖的系统库
 | `POST` | `/api/auth/login` | 登录 | `200` |
 | `POST` | `/api/auth/logout` | 退出登录 | `204` |
 | `GET` | `/api/auth/me` | 当前登录用户 | `200` |
-| `GET` | `/api/tasks` | 任务列表（不含已删除，最新的在最前） | `200` |
-| `POST` | `/api/tasks` | 新增任务 | `201` |
-| `PATCH` | `/api/tasks/{id}` | 标记完成 / 取消完成 | `200` |
+| `GET` | `/api/tasks` | 任务列表（不含已删除，按拖动顺序排列） | `200` |
+| `POST` | `/api/tasks` | 新增任务（排到最前） | `201` |
+| `PATCH` | `/api/tasks/{id}` | 标记完成 / 取消完成 / 设置标记色 | `200` |
+| `PUT` | `/api/tasks/order` | 拖动排序：`{"ids": [...]}`，顺序即展示顺序 | `204` |
 | `DELETE` | `/api/tasks/{id}` | 删除任务（逻辑删除） | `204` |
 | `GET` | `/api/health` | 健康检查（无需登录） | `200` |
 
@@ -278,9 +284,16 @@ sudo .venv/bin/playwright install-deps chromium   # Chromium 依赖的系统库
   "content": "写周报",
   "completed": false,
   "created_at": "2026-09-20T13:48:00+00:00",
-  "completed_at": null
+  "completed_at": null,
+  "color": "red"
 }
 ```
+
+`color` 取值 `red` / `yellow` / `green` / `null`（无标记）。
+`PATCH /api/tasks/{id}` 是部分更新：传 `{"color": "red"}` 只改颜色，
+传 `{"color": null}` 清除颜色；`completed` 必须是真正的 JSON 布尔值。
+`PUT /api/tasks/order` 要求 `ids` 与当前任务集合完全一致（无重复、无遗漏），
+否则返回 `422`——这是「客户端数据已过期，请刷新」的信号。
 
 时间统一是 UTC ISO-8601 字符串，由前端转换成用户本地时间展示。
 未完成的任务 `completed_at` 恒为 `null`。
@@ -334,19 +347,20 @@ curl -b /tmp/plan.txt http://127.0.0.1:8000/api/tasks
 users     (id, username, password_hash, created_at)
 sessions  (token, user_id → users.id, created_at, expires_at)
 tasks     (id, user_id → users.id, content, completed,
-           created_at, completed_at, deleted_at)
+           created_at, completed_at, deleted_at, sort_order, color)
 ```
 
 几个约束值得留意：
 
 - `users` 上建了 `lower(username)` 的唯一索引，用户名大小写不敏感（`Alice` 和 `alice` 是同一个账号）
-- `tasks.completed` 有 `CHECK (completed IN (0,1))` 约束
+- `tasks.completed` 有 `CHECK (completed IN (0,1))` 约束；`color` 只允许 `red/yellow/green/NULL`
+- `tasks.sort_order` 决定展示顺序，越大越靠前；旧库启动时会自动补列并回填（见设计说明）
 - 外键均带 `ON DELETE CASCADE`，删号时任务和会话自动清理
 
 查看数据：
 
 ```bash
-sqlite3 data/plan.db "SELECT id, user_id, content, completed, deleted_at FROM tasks;"
+sqlite3 data/plan.db "SELECT id, user_id, content, completed, sort_order, color, deleted_at FROM tasks;"
 ```
 
 ---
@@ -358,11 +372,29 @@ sqlite3 data/plan.db "SELECT id, user_id, content, completed, deleted_at FROM ta
 **删除是逻辑删除，但接口返回 404。** 需求要求逻辑删除，所以数据行永远保留；
 但对使用者来说删掉就是删掉了，因此列表、修改、再次删除都按「不存在」处理。
 
-**新加的任务排在最前面。** 添加成功后列表回到顶部，刚写下的那件事立刻
-看得见，任务变多后也不用往下翻找。列表按 `id DESC` 排序而不是按
-`created_at`，因为创建时间只精确到秒，同一秒内连续添加几条时只有自增
-主键能保证先后不串。完成状态只换配色，不改变位置，避免点一下「完成」
-条目就跳走。
+**排序靠 `sort_order` 列，而不是 `created_at`。** 新任务取当前用户
+`MAX(sort_order) + 1` 排到最前，列表按 `sort_order DESC, id DESC` 展示。
+用自增值而不是时间，是因为创建时间只精确到秒，同一秒内连续添加几条时
+会串序。完成状态只换配色、不改变位置，避免点一下「完成」条目就跳走。
+拖动排序一次性地重写整组 `sort_order`（`PUT /api/tasks/order`），
+接口要求 `ids` 集合与当前任务完全一致——不一致返回 `422`，前端据此知道
+自己手里的列表过期了，会重新拉取。
+
+**旧库升级是自动的。** `tasks` 表后来加过 `sort_order` / `color` 两列，
+`Database.initialize()` 在启动时会检查缺哪些列并 `ALTER TABLE` 补上；
+`sort_order` 回填为 `id`，恰好保持旧版本 `id DESC` 的展示顺序不变。
+
+**拖动是手写的 Pointer Events，没有引库。** HTML5 的 Drag and Drop 在
+触屏上不可用，而这款应用要在手机上能用，所以拖动走 pointer 事件：
+从卡片左侧把手开始（`touch-action: none`，不与列表滚动抢手势），
+超过 8px 阈值才进入拖动态，跨过相邻卡片中线即插入，其余卡片用 FLIP
+动画让位，松手后整体提交。两个容易踩的坑记一下：一是 Chromium 的触摸
+命中测试会把不可点击元素上的触摸重定向到附近最近的可点击元素，所以把手
+必须是 `<button>` 而不是 `<div>`；二是拖动中卡片移动会释放 pointer
+capture，所以 move/up/cancel 监听挂在 `document` 上。
+
+**颜色存的是枚举字符串，前后端各自兜底。** 后端 pydantic 用 `Literal`
+限定取值，前端渲染类名前再查一次白名单，杜绝把不可信内容拼进 class。
 
 **「完成」是幂等的。** 重复标记完成不会刷新完成时间，保留第一次完成的时间点；
 取消完成会清空 `completed_at`，这样列表里「完成于」的信息始终真实。

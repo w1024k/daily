@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from app import repository
+from app.db import Database
 
 T0 = "2026-01-01T00:00:00+00:00"
 T1 = "2026-01-01T01:00:00+00:00"
@@ -180,3 +181,109 @@ class TestSoftDelete:
         assert row["completed"] == 1
         assert row["completed_at"] == T1
         assert row["deleted_at"] == T1
+
+
+class TestTaskOrdering:
+    def test_new_task_gets_front_position(self, conn, alice_id):
+        """sort_order 递增，新任务列表里排最前。"""
+        first = repository.create_task(conn, alice_id, "第一件", T0)
+        second = repository.create_task(conn, alice_id, "第二件", T0)
+        assert [t["id"] for t in repository.list_tasks(conn, alice_id)] == [second["id"], first["id"]]
+
+    def test_sort_order_is_scoped_per_user(self, conn, alice_id, bob_id):
+        """两个用户的 sort_order 各自计数，互不影响。"""
+        repository.create_task(conn, alice_id, "a1", T0)
+        repository.create_task(conn, bob_id, "b1", T0)
+        repository.create_task(conn, alice_id, "a2", T0)
+        assert [t["content"] for t in repository.list_tasks(conn, alice_id)] == ["a2", "a1"]
+        assert [t["content"] for t in repository.list_tasks(conn, bob_id)] == ["b1"]
+
+    def test_reorder_rewrites_positions(self, conn, alice_id):
+        a = repository.create_task(conn, alice_id, "a", T0)
+        b = repository.create_task(conn, alice_id, "b", T0)
+        c = repository.create_task(conn, alice_id, "c", T0)
+        assert repository.reorder_tasks(conn, alice_id, [a["id"], c["id"], b["id"]]) is True
+        assert [t["content"] for t in repository.list_tasks(conn, alice_id)] == ["a", "c", "b"]
+
+    def test_reorder_fails_on_missing_task(self, conn, alice_id):
+        a = repository.create_task(conn, alice_id, "a", T0)
+        assert repository.reorder_tasks(conn, alice_id, [a["id"], 9999]) is False
+
+    def test_reorder_ignores_other_users_task(self, conn, alice_id, bob_id):
+        a = repository.create_task(conn, alice_id, "a", T0)
+        b = repository.create_task(conn, bob_id, "b", T0)
+        assert repository.reorder_tasks(conn, alice_id, [a["id"], b["id"]]) is False
+
+    def test_reorder_ignores_deleted_task(self, conn, alice_id):
+        a = repository.create_task(conn, alice_id, "a", T0)
+        b = repository.create_task(conn, alice_id, "b", T0)
+        repository.soft_delete_task(conn, b["id"], alice_id, T1)
+        assert repository.reorder_tasks(conn, alice_id, [a["id"], b["id"]]) is False
+
+    def test_legacy_database_is_upgraded_in_place(self, tmp_path):
+        """旧库（无 sort_order / color 列）升级后：列补上，原展示顺序不变。"""
+        path = str(tmp_path / "legacy.db")
+        raw = sqlite3.connect(path)
+        raw.execute(
+            """
+            CREATE TABLE tasks (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                content      TEXT    NOT NULL,
+                completed    INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT    NOT NULL,
+                completed_at TEXT,
+                deleted_at   TEXT
+            )
+            """
+        )
+        raw.executemany(
+            "INSERT INTO tasks (user_id, content, completed, created_at) VALUES (1, ?, 0, ?)",
+            [("旧任务一", T0), ("旧任务二", T0), ("旧任务三", T0)],
+        )
+        raw.commit()
+        raw.close()
+
+        Database(path).initialize()
+        Database(path).initialize()  # 幂等：重复初始化不报错、不改变结果
+
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            assert {"sort_order", "color"} <= columns
+            rows = conn.execute("SELECT id, sort_order, color FROM tasks ORDER BY id").fetchall()
+            # 回填 sort_order = id：此前按 id DESC 展示，升级后顺序不变
+            assert all(row["sort_order"] == row["id"] for row in rows)
+            assert all(row["color"] is None for row in rows)
+        finally:
+            conn.close()
+
+
+class TestTaskColor:
+    def test_new_task_has_no_color(self, conn, alice_id):
+        task = repository.create_task(conn, alice_id, "无颜色", T0)
+        assert task["color"] is None
+
+    def test_set_color(self, conn, alice_id):
+        task = repository.create_task(conn, alice_id, "买牛奶", T0)
+        assert repository.set_task_color(conn, task["id"], alice_id, "red") == 1
+        updated = repository.task_to_dict(repository.get_task(conn, task["id"], alice_id))
+        assert updated["color"] == "red"
+
+    def test_clear_color(self, conn, alice_id):
+        task = repository.create_task(conn, alice_id, "买牛奶", T0)
+        repository.set_task_color(conn, task["id"], alice_id, "green")
+        assert repository.set_task_color(conn, task["id"], alice_id, None) == 1
+        updated = repository.task_to_dict(repository.get_task(conn, task["id"], alice_id))
+        assert updated["color"] is None
+
+    def test_cannot_color_other_users_task(self, conn, alice_id, bob_id):
+        task = repository.create_task(conn, alice_id, "alice 的任务", T0)
+        assert repository.set_task_color(conn, task["id"], bob_id, "red") == 0
+        assert repository.get_task(conn, task["id"], alice_id)["color"] is None
+
+    def test_cannot_color_deleted_task(self, conn, alice_id):
+        task = repository.create_task(conn, alice_id, "待删除", T0)
+        repository.soft_delete_task(conn, task["id"], alice_id, T1)
+        assert repository.set_task_color(conn, task["id"], alice_id, "red") == 0

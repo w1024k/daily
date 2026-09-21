@@ -31,7 +31,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
-    # 任务：deleted_at 非空即逻辑删除
+    # 任务：deleted_at 非空即逻辑删除；sort_order 决定列表顺序（越大越靠前）；
+    # color 是红/黄/绿标记色，可空
     """
     CREATE TABLE IF NOT EXISTS tasks (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,11 +41,28 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         completed    INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
         created_at   TEXT    NOT NULL,
         completed_at TEXT,
-        deleted_at   TEXT
+        deleted_at   TEXT,
+        sort_order   INTEGER NOT NULL DEFAULT 0,
+        color        TEXT CHECK (color IN ('red', 'yellow', 'green') OR color IS NULL)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON tasks(user_id, deleted_at, id)",
 )
+
+
+def _upgrade_tasks_columns(conn: sqlite3.Connection) -> None:
+    """旧库升级：补上后来新增的列（幂等，新库上什么都不做）。
+
+    旧版 tasks 表没有 sort_order / color。因为 ``CREATE TABLE IF NOT EXISTS``
+    对已存在的表是空操作，必须靠这里手动补列。
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "sort_order" not in existing:
+        conn.execute("ALTER TABLE tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+        # 旧版本按 id DESC 展示（新的在前），回填为 id 可保持原顺序不变
+        conn.execute("UPDATE tasks SET sort_order = id")
+    if "color" not in existing:
+        conn.execute("ALTER TABLE tasks ADD COLUMN color TEXT")
 
 
 class Database:
@@ -65,11 +83,12 @@ class Database:
         return conn
 
     def initialize(self) -> None:
-        """建表。幂等，可重复调用。"""
+        """建表 + 升级旧库。幂等，可重复调用。"""
         conn = self.connect()
         try:
             with conn:
                 for statement in SCHEMA_STATEMENTS:
                     conn.execute(statement)
+                _upgrade_tasks_columns(conn)
         finally:
             conn.close()

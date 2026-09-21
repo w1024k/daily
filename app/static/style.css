@@ -26,6 +26,11 @@
   --danger-hover:  #bf2f35;
   --danger-soft:   #fdeeee;
 
+  /* 任务标记色（红 / 黄 / 绿） */
+  --color-red:    #e5534b;
+  --color-yellow: #d99a1b;
+  --color-green:  #4c9e60;
+
   --radius-sm: 8px;
   --radius:    12px;
   --radius-lg: 18px;
@@ -66,6 +71,11 @@
     --danger:        #f2676c;
     --danger-hover:  #f58286;
     --danger-soft:   #2c1a1c;
+
+    /* 深色背景上标记色提亮一档 */
+    --color-red:    #f0665e;
+    --color-yellow: #e5b04d;
+    --color-green:  #5cb574;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
     --shadow-md: 0 12px 32px rgba(0, 0, 0, .45);
@@ -351,7 +361,8 @@ button { font: inherit; color: inherit; }
   background: var(--surface);
   box-shadow: var(--shadow-sm);
   transition: border-color .18s var(--ease), background .18s var(--ease),
-              box-shadow .18s var(--ease), opacity .18s var(--ease);
+              box-shadow .18s var(--ease), opacity .18s var(--ease),
+              transform .18s var(--ease);
   animation: slide-in .28s var(--ease) both;
 }
 
@@ -364,6 +375,8 @@ button { font: inherit; color: inherit; }
   opacity: 0;
   transform: translateX(12px);
   transition: opacity .2s var(--ease), transform .2s var(--ease);
+  /* 入场动画 fill-mode: both 会以动画优先级锁死 transform/opacity，必须关掉 */
+  animation: none;
 }
 
 /* 已完成：换一种颜色（需求 4） */
@@ -460,6 +473,115 @@ button { font: inherit; color: inherit; }
 
 .task__action:hover { background: var(--surface-muted); color: var(--text); }
 .task__action--danger:hover { background: var(--danger-soft); color: var(--danger); }
+
+/* ── 标记色（红 / 黄 / 绿圆点） ─────────────────────────────────────── */
+
+.task__colors {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 5px;
+  opacity: 0;
+  transition: opacity .15s var(--ease);
+}
+
+/* 鼠标设备：悬停 / 键盘聚焦时露出圆点；已标记颜色的卡片圆点常显 */
+.task:hover .task__colors,
+.task:focus-within .task__colors,
+.task--red .task__colors,
+.task--yellow .task__colors,
+.task--green .task__colors { opacity: 1; }
+
+.task__color {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: .35;
+  -webkit-tap-highlight-color: transparent;
+  transition: opacity .15s var(--ease), transform .15s var(--ease);
+}
+
+/* 小圆点不好点，扩大热区但不改变视觉大小 */
+.task__color::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+}
+
+.task__color:hover { opacity: .8; transform: scale(1.2); }
+.task__color.is-active { opacity: 1; transform: scale(1.12); }
+
+.task__color[data-color='red']    { background: var(--color-red); }
+.task__color[data-color='yellow'] { background: var(--color-yellow); }
+.task__color[data-color='green']  { background: var(--color-green); }
+
+/* 卡片本体：左侧色条 + 极淡的底色（不支持 color-mix 的浏览器只有色条） */
+.task--red    { --task-color: var(--color-red); }
+.task--yellow { --task-color: var(--color-yellow); }
+.task--green  { --task-color: var(--color-green); }
+
+.task--red,
+.task--yellow,
+.task--green {
+  box-shadow: inset 3px 0 0 var(--task-color), var(--shadow-sm);
+}
+
+@supports (background: color-mix(in srgb, red 50%, blue)) {
+  .task--red    { background: color-mix(in srgb, var(--color-red) 7%, var(--surface)); }
+  .task--yellow { background: color-mix(in srgb, var(--color-yellow) 9%, var(--surface)); }
+  .task--green  { background: color-mix(in srgb, var(--color-green) 7%, var(--surface)); }
+}
+
+/* ── 拖动排序 ───────────────────────────────────────────────────────── */
+
+.task__grip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 22px;
+  margin-top: 1px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: grab;
+  /* 触摸从把手开始时不触发列表滚动，滚动照常从卡片其他区域触发 */
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: opacity .15s var(--ease);
+}
+
+.task:hover .task__grip,
+.task:focus-within .task__grip { opacity: .6; }
+
+.task.is-dragging {
+  position: relative;
+  z-index: 1;
+  opacity: .94;
+  cursor: grabbing;
+  box-shadow: var(--shadow-md);
+  /* 同上：解除入场动画对 transform/opacity 的锁定，FLIP 才能生效 */
+  animation: none;
+}
+
+.task.is-dragging .task__grip { opacity: 1; cursor: grabbing; }
+
+/* 拖动过程中卡片上的按钮都不响应，避免误触 */
+.task.is-dragging .task__check,
+.task.is-dragging .task__color,
+.task.is-dragging .task__action { pointer-events: none; }
+
+/* 拖动过程中禁止选中文字 */
+body.is-sorting .task { user-select: none; -webkit-user-select: none; }
 
 /* ── 空状态 ─────────────────────────────────────────────────────────── */
 
@@ -581,8 +703,9 @@ button { font: inherit; color: inherit; }
    ========================================================================== */
 
 @media (hover: none) {
-  /* 没有悬停概念，操作按钮常显 */
+  /* 没有悬停概念，操作按钮与标记色圆点常显 */
   .task__actions { opacity: 1; }
+  .task__colors { opacity: 1; }
 
   /* 扩大勾选按钮的点击热区，但不改变视觉大小 */
   .task__check { position: relative; }
@@ -591,6 +714,14 @@ button { font: inherit; color: inherit; }
     position: absolute;
     inset: -10px;
     border-radius: 50%;
+  }
+
+  /* 拖动把手常显，并上下扩大热区（左右不扩，避免盖住勾选按钮） */
+  .task__grip { opacity: .5; position: relative; }
+  .task__grip::after {
+    content: '';
+    position: absolute;
+    inset: -8px 0;
   }
 
   /* 触摸目标尽量接近 44px */
@@ -625,8 +756,8 @@ button { font: inherit; color: inherit; }
     justify-content: flex-end;
     gap: 4px;
     margin-top: 6px;
-    /* 与正文左对齐（勾选按钮宽度 + 间距） */
-    padding-left: 33px;
+    /* 与正文左对齐（把手 + 勾选按钮宽度 + 间距） */
+    padding-left: 58px;
   }
 
   .empty { margin-top: 6vh; }

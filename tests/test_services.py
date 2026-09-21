@@ -247,3 +247,117 @@ class TestDeleteTask:
         user_id, _ = task
         with pytest.raises(NotFound):
             services.delete_task(conn, user_id, 999_999)
+
+
+class TestTaskColor:
+    @pytest.fixture
+    def task(self, conn, make_user):
+        user_id = make_user("alice")
+        return user_id, services.add_task(conn, user_id, "需要标记的")
+
+    def test_set_and_read_color(self, conn, task):
+        user_id, item = task
+        updated = services.set_task_color(conn, user_id, item["id"], "red")
+        assert updated["color"] == "red"
+        assert [t["color"] for t in services.list_tasks(conn, user_id)] == ["red"]
+
+    def test_clear_color_with_none(self, conn, task):
+        user_id, item = task
+        services.set_task_color(conn, user_id, item["id"], "green")
+        cleared = services.set_task_color(conn, user_id, item["id"], None)
+        assert cleared["color"] is None
+
+    @pytest.mark.parametrize("bad", ["blue", "RED", "", "red ", 3, True])
+    def test_invalid_color_rejected(self, conn, task, bad):
+        user_id, item = task
+        with pytest.raises(ValidationFailed):
+            services.set_task_color(conn, user_id, item["id"], bad)
+
+    def test_color_survives_completed_toggle(self, conn, task):
+        """切完成状态不能动标记色。"""
+        user_id, item = task
+        services.set_task_color(conn, user_id, item["id"], "yellow")
+        done = services.set_task_completed(conn, user_id, item["id"], True)
+        assert done["color"] == "yellow"
+
+    def test_cannot_color_other_users_task(self, conn, task, make_user):
+        _, item = task
+        intruder = make_user("bob")
+        with pytest.raises(NotFound):
+            services.set_task_color(conn, intruder, item["id"], "red")
+
+    def test_missing_task_raises(self, conn, task):
+        user_id, _ = task
+        with pytest.raises(NotFound):
+            services.set_task_color(conn, user_id, 999_999, "red")
+
+
+class TestReorderTasks:
+    @pytest.fixture
+    def three(self, conn, make_user):
+        """三条任务，返回 (user_id, [第三, 第二, 第一] 按展示顺序)。"""
+        user_id = make_user("alice")
+        ids = [services.add_task(conn, user_id, f"第{i}件")["id"] for i in (1, 2, 3)]
+        return user_id, ids
+
+    def test_reorder_changes_list_order(self, conn, three):
+        user_id, ids = three
+        # 展示顺序是 [第3件, 第2件, 第1件]；把它改成 [第1件, 第3件, 第2件]
+        services.reorder_tasks(conn, user_id, [ids[0], ids[2], ids[1]])
+        assert [t["content"] for t in services.list_tasks(conn, user_id)] == ["第1件", "第3件", "第2件"]
+
+    def test_reorder_persists(self, conn, three):
+        """排序写入数据库并提交，之后直接查表验证。"""
+        user_id, ids = three
+        services.reorder_tasks(conn, user_id, [ids[1], ids[0], ids[2]])
+        orders = dict(
+            conn.execute("SELECT id, sort_order FROM tasks WHERE user_id = ?", (user_id,))
+        )
+        # 排第 0 位的 ids[1] 拿到最大的 sort_order
+        assert orders[ids[1]] > orders[ids[0]] > orders[ids[2]]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            None,
+            [],
+            "3,2,1",
+            [True, 1],
+            ["3", "2", "1"],
+        ],
+    )
+    def test_invalid_payload_rejected(self, conn, three, bad):
+        user_id, ids = three
+        with pytest.raises(ValidationFailed):
+            services.reorder_tasks(conn, user_id, bad)
+
+    def test_duplicate_ids_rejected(self, conn, three):
+        user_id, ids = three
+        with pytest.raises(ValidationFailed):
+            services.reorder_tasks(conn, user_id, [ids[0], ids[1], ids[0]])
+
+    def test_missing_id_rejected(self, conn, three):
+        user_id, ids = three
+        with pytest.raises(ValidationFailed):
+            services.reorder_tasks(conn, user_id, [ids[0], ids[1]])
+        with pytest.raises(ValidationFailed):
+            services.reorder_tasks(conn, user_id, [ids[0], ids[1], 999_999])
+
+    def test_other_users_task_rejected(self, conn, three, make_user):
+        user_id, ids = three
+        bob_id = make_user("bob")
+        bob_task = services.add_task(conn, bob_id, "bob 的")
+        with pytest.raises(ValidationFailed):
+            services.reorder_tasks(conn, user_id, [ids[0], ids[1], bob_task["id"]])
+
+    def test_deleted_task_rejected(self, conn, three):
+        user_id, ids = three
+        services.delete_task(conn, user_id, ids[2])
+        with pytest.raises(ValidationFailed):
+            services.reorder_tasks(conn, user_id, [ids[0], ids[1], ids[2]])
+
+    def test_single_task_is_noop(self, conn, make_user):
+        user_id = make_user("alice")
+        item = services.add_task(conn, user_id, "唯一")
+        services.reorder_tasks(conn, user_id, [item["id"]])  # 不报错
+        assert [t["id"] for t in services.list_tasks(conn, user_id)] == [item["id"]]

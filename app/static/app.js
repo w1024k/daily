@@ -13,11 +13,26 @@
     register: '/api/auth/register',
     logout: '/api/auth/logout',
     tasks: '/api/tasks',
+    order: '/api/tasks/order',
   };
 
   const CHECK_ICON =
     '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" ' +
     'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3.2L13 5"/></svg>';
+
+  // 拖动把手：两列三行的六个小圆点
+  const GRIP_ICON =
+    '<svg viewBox="0 0 10 16" width="10" height="16" fill="currentColor" aria-hidden="true">' +
+    '<circle cx="2.5" cy="2.5" r="1.3"/><circle cx="7.5" cy="2.5" r="1.3"/>' +
+    '<circle cx="2.5" cy="8" r="1.3"/><circle cx="7.5" cy="8" r="1.3"/>' +
+    '<circle cx="2.5" cy="13.5" r="1.3"/><circle cx="7.5" cy="13.5" r="1.3"/></svg>';
+
+  const TASK_COLORS = [
+    { name: 'red', label: '红' },
+    { name: 'yellow', label: '黄' },
+    { name: 'green', label: '绿' },
+  ];
+  const COLOR_NAMES = new Set(TASK_COLORS.map((entry) => entry.name));
 
   const state = {
     user: null,
@@ -240,9 +255,30 @@
   }
 
   function buildTaskElement(task, animate) {
+    // 颜色来自服务端（枚举已校验），这里再兜底白名单一次，
+    // 确保类名永远不会拼进不可信内容
+    const colorName = task.color && COLOR_NAMES.has(task.color) ? task.color : null;
+
     const li = document.createElement('li');
-    li.className = 'task' + (task.completed ? ' task--done' : '') + (animate ? '' : ' task--static');
+    li.className =
+      'task' +
+      (task.completed ? ' task--done' : '') +
+      (colorName ? ' task--' + colorName : '') +
+      (animate ? '' : ' task--static');
     li.dataset.id = String(task.id);
+
+    // 用 button 而不是 div：Chromium 的触摸命中测试会把不可点击元素上的
+    // 触摸重定向到附近最近的可点击元素（touch target adjustment），
+    // div 会被跳过去，touch 永远落不到把手上
+    const grip = document.createElement('button');
+    grip.type = 'button';
+    grip.className = 'task__grip';
+    grip.setAttribute('tabindex', '-1');
+    grip.setAttribute('aria-hidden', 'true');
+    grip.innerHTML = GRIP_ICON;
+    // 只在把手上监听按下；move/up/cancel 挂在 document 上（见拖动排序一节），
+    // 因为拖动中卡片会移动，pointer capture 会随之失效
+    grip.addEventListener('pointerdown', gripPointerDown);
 
     const check = document.createElement('button');
     check.type = 'button';
@@ -273,6 +309,19 @@
     body.appendChild(content);
     body.appendChild(meta);
 
+    const colors = document.createElement('div');
+    colors.className = 'task__colors';
+    TASK_COLORS.forEach((entry) => {
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.className = 'task__color' + (task.color === entry.name ? ' is-active' : '');
+      dot.dataset.action = 'color';
+      dot.dataset.color = entry.name;
+      dot.setAttribute('aria-label', entry.label + '色标记');
+      dot.setAttribute('aria-pressed', String(task.color === entry.name));
+      colors.appendChild(dot);
+    });
+
     const actions = document.createElement('div');
     actions.className = 'task__actions';
 
@@ -291,8 +340,10 @@
     actions.appendChild(toggle);
     actions.appendChild(remove);
 
+    li.appendChild(grip);
     li.appendChild(check);
     li.appendChild(body);
+    li.appendChild(colors);
     li.appendChild(actions);
     return li;
   }
@@ -407,6 +458,210 @@
     }
   }
 
+  async function setColor(id, color) {
+    const task = findTask(id);
+    if (!task) return;
+
+    // 再点一次同色圆点 = 取消标记
+    const next = task.color === color ? null : color;
+    const element = findElement(id);
+    setElementBusy(element, true);
+    try {
+      const updated = await api(API.tasks + '/' + id, { method: 'PATCH', body: { color: next } });
+      const index = state.tasks.findIndex((item) => item.id === id);
+      if (index !== -1) state.tasks[index] = updated;
+      if (element) element.replaceWith(buildTaskElement(updated, false));
+    } catch (error) {
+      handleError(error);
+      setElementBusy(element, false);
+    }
+  }
+
+  /* ── 拖动排序 ─────────────────────────────────────────────────────── */
+
+  /*
+   * 用 Pointer Events 自己实现，而不是 HTML5 Drag and Drop：
+   * 后者在触屏上不可用，而这款应用要在手机上能用。
+   * 拖动从卡片左侧的把手开始，不跟列表滚动抢手势。
+   */
+
+  const DRAG_THRESHOLD = 8; // 移动超过 8px 才判定为拖动（区分误触）
+  const AUTO_SCROLL_ZONE = 48; // 靠近列表上下边缘时自动滚动的触发区
+  const AUTO_SCROLL_STEP = 10;
+
+  let dragState = null; // { pointerId, grip, element, started, startX, startY, originalOrder }
+  let autoScrollFrame = null;
+
+  function gripPointerDown(event) {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    const element = event.currentTarget.closest('.task');
+    if (!element || dragState) return;
+    event.preventDefault();
+    // 尽量拿到 capture（指针移出窗口时也能收到事件）；DOM 移动会释放它，
+    // 后续事件靠 document 级监听兜底，并在每次移动后重建
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch (error) {
+      /* capture 失败不影响主流程 */
+    }
+    dragState = {
+      pointerId: event.pointerId,
+      grip: event.currentTarget,
+      element: element,
+      started: false,
+      startX: event.clientX,
+      startY: event.clientY,
+      originalOrder: [],
+    };
+  }
+
+  function globalPointerMove(event) {
+    const d = dragState;
+    if (!d || d.pointerId !== event.pointerId) return;
+
+    if (!d.started) {
+      const moved =
+        Math.abs(event.clientX - d.startX) + Math.abs(event.clientY - d.startY);
+      if (moved < DRAG_THRESHOLD) return;
+      d.started = true;
+      d.originalOrder = Array.from(taskList.children);
+      d.element.classList.add('is-dragging');
+      document.body.classList.add('is-sorting');
+    }
+
+    event.preventDefault();
+    autoScroll(event.clientY);
+
+    // 找到指针下方第一张「中线在其下方」的兄弟卡片，插到它前面
+    const siblings = Array.from(taskList.children).filter((li) => li !== d.element);
+    let reference = null;
+    for (const sibling of siblings) {
+      const rect = sibling.getBoundingClientRect();
+      if (event.clientY < rect.top + rect.height / 2) {
+        reference = sibling;
+        break;
+      }
+    }
+    if (reference === d.element.nextElementSibling) return; // 位置没变
+    moveTaskElement(d.element, reference);
+  }
+
+  function globalPointerUp(event) {
+    const d = dragState;
+    if (!d || d.pointerId !== event.pointerId) return;
+    dragState = null;
+    stopAutoScroll();
+    document.body.classList.remove('is-sorting');
+    if (!d.started) return;
+
+    d.element.classList.remove('is-dragging');
+
+    const order = Array.from(taskList.children).map((li) => Number(li.dataset.id));
+    const original = d.originalOrder.map((li) => Number(li.dataset.id));
+    const changed =
+      order.length !== original.length || order.some((id, index) => id !== original[index]);
+    if (!changed) return;
+
+    applyOrder(order); // 本地立即生效
+    persistOrder(order); // 异步提交给服务端，失败时回滚
+  }
+
+  function globalPointerCancel(event) {
+    const d = dragState;
+    if (!d || d.pointerId !== event.pointerId) return;
+    cancelDrag();
+  }
+
+  function cancelDrag() {
+    const d = dragState;
+    dragState = null;
+    stopAutoScroll();
+    document.body.classList.remove('is-sorting');
+    if (!d || !d.started) return;
+    d.element.classList.remove('is-dragging');
+    // 触摸被系统打断 / 按了 Esc：恢复拖动前的顺序
+    taskList.textContent = '';
+    d.originalOrder.forEach((li) => taskList.appendChild(li));
+  }
+
+  /** 把被拖卡片插到 reference 前，其余卡片用 FLIP 动画平滑让位。 */
+  function moveTaskElement(element, reference) {
+    const items = Array.from(taskList.children);
+    const tops = new Map();
+    items.forEach((li) => tops.set(li, li.getBoundingClientRect().top));
+
+    if (reference === null) taskList.appendChild(element);
+    else taskList.insertBefore(element, reference);
+
+    // 卡片移动会把它从文档树摘下再插入，pointer capture 随之释放，
+    // 这里重建，让指针移出窗口等边缘情况仍能收到事件
+    if (dragState) {
+      try {
+        dragState.grip.setPointerCapture(dragState.pointerId);
+      } catch (error) {
+        /* 忽略 */
+      }
+    }
+
+    items.forEach((li) => {
+      const delta = tops.get(li) - li.getBoundingClientRect().top;
+      if (delta === 0) return;
+      // 入场动画 fill-mode: both 会锁死 transform，先解除再用 transform 过渡
+      li.style.animation = 'none';
+      li.style.transition = 'none';
+      li.style.transform = 'translateY(' + delta + 'px)';
+      li.offsetHeight; // 强制 reflow，让浏览器记录起始位置
+      li.style.transition = '';
+      li.style.transform = '';
+    });
+  }
+
+  function applyOrder(order) {
+    const byId = new Map(state.tasks.map((task) => [task.id, task]));
+    const next = order.map((id) => byId.get(id)).filter(Boolean);
+    if (next.length !== state.tasks.length) return;
+    state.tasks = next;
+    updateMeta();
+  }
+
+  async function persistOrder(order) {
+    try {
+      await api(API.order, { method: 'PUT', body: { ids: order } });
+    } catch (error) {
+      handleError(error);
+      loadTasks(); // 以服务端顺序为准，回滚本地改动
+    }
+  }
+
+  function autoScroll(clientY) {
+    const rect = board.getBoundingClientRect();
+    let step = 0;
+    if (clientY < rect.top + AUTO_SCROLL_ZONE) step = -AUTO_SCROLL_STEP;
+    else if (clientY > rect.bottom - AUTO_SCROLL_ZONE) step = AUTO_SCROLL_STEP;
+    if (step === 0) {
+      stopAutoScroll();
+      return;
+    }
+
+    function tick() {
+      const before = board.scrollTop;
+      board.scrollTop += step;
+      if (board.scrollTop === before) {
+        stopAutoScroll(); // 到顶/到底了
+        return;
+      }
+      autoScrollFrame = requestAnimationFrame(tick);
+    }
+    if (autoScrollFrame === null) autoScrollFrame = requestAnimationFrame(tick);
+  }
+
+  function stopAutoScroll() {
+    if (autoScrollFrame !== null) {
+      cancelAnimationFrame(autoScrollFrame);
+      autoScrollFrame = null;
+    }
+  }
+
   /* ── 确认弹窗 ─────────────────────────────────────────────────────── */
 
   function confirmDialog(options) {
@@ -489,10 +744,21 @@
     if (!element) return;
     const id = Number(element.dataset.id);
     if (button.dataset.action === 'toggle') toggleTask(id);
+    else if (button.dataset.action === 'color') setColor(id, button.dataset.color);
     else if (button.dataset.action === 'delete') deleteTask(id);
   });
 
+  // 拖动的 move/up/cancel 挂在 document 上：拖动中卡片会移动，
+  // capture 可能失效，而 pointer 事件会冒泡到 document，这里必然收到
+  document.addEventListener('pointermove', globalPointerMove);
+  document.addEventListener('pointerup', globalPointerUp);
+  document.addEventListener('pointercancel', globalPointerCancel);
+
   document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && dragState && dragState.started) {
+      cancelDrag();
+      return;
+    }
     if (event.key === '/' && document.activeElement !== taskInput && !appView.hidden) {
       event.preventDefault();
       taskInput.focus();
